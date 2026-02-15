@@ -1,11 +1,14 @@
+mod parser_policy;
+
 use anyhow::{Result, bail};
-use clap::{Parser, ValueEnum};
+use clap::Parser;
 use flate2::Compression;
 use flate2::write::ZlibEncoder;
 use image::{Rgba, RgbaImage, imageops};
 use indicatif::ProgressBar;
 use itertools::Itertools;
 use lazy_static::lazy_static;
+use parser_policy::{ParserPolicy, validate_signature};
 use rayon::prelude::*;
 use regex::Regex;
 use std::collections::HashMap;
@@ -31,11 +34,6 @@ struct Cli {
     policy: ParserPolicy,
 }
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
-enum ParserPolicy {
-    Strict,
-    Loose,
-}
 const A5X_WIDTH: usize = 1404;
 const A5X_HEIGHT: usize = 1872;
 const A5X2_WIDTH: usize = 1920;
@@ -96,43 +94,6 @@ fn get_signature(file: &mut File) -> Result<String> {
     let signature_string = String::from_utf8(signature_bytes)?.trim_end_matches('\0').to_string();
 
     Ok(signature_string)
-}
-
-fn is_supported_signature(signature: &str) -> bool {
-    // Known X-series signatures from observed firmware versions.
-    const KNOWN_SIGNATURES: [&str; 11] = [
-        "SN_FILE_VER_20200001",
-        "SN_FILE_VER_20200005",
-        "SN_FILE_VER_20200006",
-        "SN_FILE_VER_20200007",
-        "SN_FILE_VER_20200008",
-        "SN_FILE_VER_20210009",
-        "SN_FILE_VER_20210010",
-        "SN_FILE_VER_20220011",
-        "SN_FILE_VER_20220013",
-        "SN_FILE_VER_20230014",
-        "SN_FILE_VER_20230015",
-    ];
-    KNOWN_SIGNATURES.contains(&signature)
-}
-
-fn validate_signature(signature: &str, policy: ParserPolicy) -> Result<()> {
-    if is_supported_signature(signature) {
-        return Ok(());
-    }
-
-    if policy == ParserPolicy::Loose {
-        eprintln!(
-            "Warning: unsupported signature '{}' detected; continuing due to --policy loose.",
-            signature
-        );
-        return Ok(());
-    }
-
-    bail!(
-        "Unsupported note signature '{}'. Re-run with --policy loose to attempt best-effort parsing.",
-        signature
-    );
 }
 
 /// Reads a metadata block at a given address and parses it into a HashMap.
