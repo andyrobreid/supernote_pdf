@@ -133,19 +133,19 @@ fn parse_metadata_block(file: &mut File, address: u64) -> Result<HashMap<String,
 
 /// Detects the device type and returns the appropriate width and height dimensions
 fn detect_device_dimensions(file: &mut File, footer_map: &HashMap<String, String>) -> Result<(usize, usize)> {
-    if let Some(header_addr_str) = footer_map.get("FILE_FEATURE") {
-        if let Ok(header_addr) = header_addr_str.parse::<u64>() {
-            let header_map = parse_metadata_block(file, header_addr)?;
-            if let Some(equipment) = header_map.get("APPLY_EQUIPMENT") {
-                return match equipment.as_str() {
-                    // A5 X2 (Manta)
-                    "N5" => Ok((A5X2_WIDTH, A5X2_HEIGHT)),
-                    // A6 X2 (Nomad)
-                    "N6" => Ok((A6X2_WIDTH, A6X2_HEIGHT)),
-                    // A5X / A6X and fallback devices currently share this size.
-                    _ => Ok((A5X_WIDTH, A5X_HEIGHT)),
-                };
-            }
+    if let Some(header_addr_str) = footer_map.get("FILE_FEATURE")
+        && let Ok(header_addr) = header_addr_str.parse::<u64>()
+    {
+        let header_map = parse_metadata_block(file, header_addr)?;
+        if let Some(equipment) = header_map.get("APPLY_EQUIPMENT") {
+            return match equipment.as_str() {
+                // A5 X2 (Manta)
+                "N5" => Ok((A5X2_WIDTH, A5X2_HEIGHT)),
+                // A6 X2 (Nomad)
+                "N6" => Ok((A6X2_WIDTH, A6X2_HEIGHT)),
+                // A5X / A6X and fallback devices currently share this size.
+                _ => Ok((A5X_WIDTH, A5X_HEIGHT)),
+            };
         }
     }
     Ok((A5X_WIDTH, A5X_HEIGHT))
@@ -206,12 +206,12 @@ fn parse_notebook(file: &mut File, policy: ParserPolicy) -> Result<Notebook> {
                 });
             }
         }
-        pages.push(Page { addr: addr, layers: layers });
+        pages.push(Page { addr, layers });
     }
 
     Ok(Notebook {
         signature: file_signature,
-        pages: pages,
+        pages,
         width,
         height,
     })
@@ -254,12 +254,12 @@ fn decode_rle(compressed_data: &[u8], width: usize, height: usize) -> Result<Vec
                 // The colors match, so combine the lengths.
                 let length = 1 + length_code as usize + (((prev_length_code & 0x7f) as usize + 1) << 7);
                 // Combined run belongs to `color_code`.
-                decompressed.extend(std::iter::repeat(color_code).take(length));
+                decompressed.extend(std::iter::repeat_n(color_code, length));
                 emit_current = false;
             } else {
                 // Colors don't match. First, process the held-over length.
                 let held_length = ((prev_length_code & 0x7f) as usize + 1) << 7;
-                decompressed.extend(std::iter::repeat(prev_color_code).take(held_length));
+                decompressed.extend(std::iter::repeat_n(prev_color_code, held_length));
             }
         }
 
@@ -277,7 +277,7 @@ fn decode_rle(compressed_data: &[u8], width: usize, height: usize) -> Result<Vec
                 // Standard case: length is just length_code + 1.
                 length = length_code as usize + 1;
             }
-            decompressed.extend(std::iter::repeat(color_code).take(length));
+            decompressed.extend(std::iter::repeat_n(color_code, length));
         }
     }
 
@@ -286,7 +286,7 @@ fn decode_rle(compressed_data: &[u8], width: usize, height: usize) -> Result<Vec
     if let Some((color_code, length_code)) = holder {
         let tail_length = adjust_rle_tail_length(length_code, decompressed.len(), expected_len);
         if tail_length > 0 {
-            decompressed.extend(std::iter::repeat(color_code).take(tail_length));
+            decompressed.extend(std::iter::repeat_n(color_code, tail_length));
         }
     }
 
@@ -494,7 +494,7 @@ fn convert_note_to_pdf(input_path: &Path, output_path: &Path, policy: ParserPoli
 }
 
 fn process_single_file(input_file: &Path, output_file: &Path, policy: ParserPolicy) -> Result<()> {
-    if input_file.extension().map_or(true, |s| s != "note") {
+    if input_file.extension().is_none_or(|s| s != "note") {
         bail!("Input file '{}' must have a .note extension.", input_file.display());
     }
     if output_file.is_dir() {
@@ -503,7 +503,7 @@ fn process_single_file(input_file: &Path, output_file: &Path, policy: ParserPoli
             output_file.display()
         );
     }
-    if output_file.extension().map_or(true, |s| s != "pdf") {
+    if output_file.extension().is_none_or(|s| s != "pdf") {
         bail!("Output file '{}' must have a .pdf extension.", output_file.display());
     }
     if output_file.exists() {
@@ -550,7 +550,7 @@ fn process_directory(input_dir: &Path, output_dir: &Path, policy: ParserPolicy) 
     let jobs: Vec<(PathBuf, PathBuf)> = WalkDir::new(input_dir)
         .into_iter()
         .filter_map(Result::ok) // Ignore errors during walk
-        .filter(|e| e.file_type().is_file() && e.path().extension().map_or(false, |s| s == "note"))
+        .filter(|e| e.file_type().is_file() && e.path().extension().is_some_and(|s| s == "note"))
         .map(|entry| {
             let input_path = entry.into_path();
             // Create the corresponding output path by mirroring the directory structure
