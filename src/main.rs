@@ -30,6 +30,8 @@ const A5X_WIDTH: usize = 1404;
 const A5X_HEIGHT: usize = 1872;
 const A5X2_WIDTH: usize = 1920;
 const A5X2_HEIGHT: usize = 2560;
+const A6X2_WIDTH: usize = 1404;
+const A6X2_HEIGHT: usize = 1872;
 
 // precompile regex
 lazy_static! {
@@ -127,11 +129,14 @@ fn detect_device_dimensions(file: &mut File, footer_map: &HashMap<String, String
         if let Ok(header_addr) = header_addr_str.parse::<u64>() {
             let header_map = parse_metadata_block(file, header_addr)?;
             if let Some(equipment) = header_map.get("APPLY_EQUIPMENT") {
-                if equipment == "N5" {
-                    return Ok((A5X2_WIDTH, A5X2_HEIGHT));
-                } else {
-                    return Ok((A5X_WIDTH, A5X_HEIGHT));
-                }
+                return match equipment.as_str() {
+                    // A5 X2 (Manta)
+                    "N5" => Ok((A5X2_WIDTH, A5X2_HEIGHT)),
+                    // A6 X2 (Nomad)
+                    "N6" => Ok((A6X2_WIDTH, A6X2_HEIGHT)),
+                    // A5X / A6X and fallback devices currently share this size.
+                    _ => Ok((A5X_WIDTH, A5X_HEIGHT)),
+                };
             }
         }
     }
@@ -203,6 +208,17 @@ fn parse_notebook(file: &mut File) -> Result<Notebook> {
     })
 }
 
+fn adjust_rle_tail_length(tail_length: u8, current_length: usize, total_length: usize) -> usize {
+    let gap = total_length.saturating_sub(current_length);
+    for shift in (0..8).rev() {
+        let candidate = (((tail_length & 0x7f) as usize) + 1) << shift;
+        if candidate <= gap {
+            return candidate;
+        }
+    }
+    0
+}
+
 /// Decodes a byte stream compressed with the RATTA_RLE algorithm.
 fn decode_rle(compressed_data: &[u8], width: usize, height: usize) -> Result<Vec<u8>> {
     // Screen dimensions
@@ -221,43 +237,45 @@ fn decode_rle(compressed_data: &[u8], width: usize, height: usize) -> Result<Vec
         let length_code = compressed_data[i + 1];
         i += 2; // Move to the next pair
 
-        let length: usize;
+        let mut emit_current = true;
 
         if let Some((prev_color_code, prev_length_code)) = holder.take() {
             // We are in the "holder" state from the previous iteration.
             if color_code == prev_color_code {
                 // The colors match, so combine the lengths.
-                length = 1 + length_code as usize + (((prev_length_code & 0x7f) as usize + 1) << 7);
+                let length = 1 + length_code as usize + (((prev_length_code & 0x7f) as usize + 1) << 7);
+                // Combined run belongs to `color_code`.
+                decompressed.extend(std::iter::repeat(color_code).take(length));
+                emit_current = false;
             } else {
                 // Colors don't match. First, process the held-over length.
                 let held_length = ((prev_length_code & 0x7f) as usize + 1) << 7;
                 decompressed.extend(std::iter::repeat(prev_color_code).take(held_length));
-                // Then, process the current pair normally.
-                length = length_code as usize + 1;
             }
-        } else if length_code == 0xff {
-            // Special marker for a long run
-            length = 0x4000; // 16384
-        } else if length_code & 0x80 != 0 {
-            // Most significant bit is set. This is a multi-byte length marker.
-            // We store the current pair in the `holder` and continue to the next iteration.
-            holder = Some((color_code, length_code));
-            continue;
-        } else {
-            // Standard case: length is just length_code + 1.
-            length = length_code as usize + 1;
         }
 
-        // Add the `color_code` to our output `length` times.
-        decompressed.extend(std::iter::repeat(color_code).take(length));
+        if emit_current {
+            let length: usize;
+            if length_code == 0xff {
+                // Special marker for a long run.
+                length = 0x4000; // 16384
+            } else if length_code & 0x80 != 0 {
+                // Most significant bit is set. This is a multi-byte length marker.
+                // Store and process at next loop iteration.
+                holder = Some((color_code, length_code));
+                continue;
+            } else {
+                // Standard case: length is just length_code + 1.
+                length = length_code as usize + 1;
+            }
+            decompressed.extend(std::iter::repeat(color_code).take(length));
+        }
     }
 
     // After the loop, check if there's a final item in the holder.
     // This can happen if the last block was a multi-byte marker.
     if let Some((color_code, length_code)) = holder {
-        let remaining_len = expected_len.saturating_sub(decompressed.len());
-        // A simple heuristic for the tail length
-        let tail_length = std::cmp::min(((length_code & 0x7f) as usize + 1) << 7, remaining_len);
+        let tail_length = adjust_rle_tail_length(length_code, decompressed.len(), expected_len);
         if tail_length > 0 {
             decompressed.extend(std::iter::repeat(color_code).take(tail_length));
         }
