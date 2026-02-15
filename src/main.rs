@@ -1,7 +1,9 @@
+mod device_profile;
 mod parser_policy;
 
 use anyhow::{Result, bail};
 use clap::Parser;
+use device_profile::resolve_device_profile;
 use flate2::Compression;
 use flate2::write::ZlibEncoder;
 use image::{Rgba, RgbaImage, imageops};
@@ -36,10 +38,6 @@ struct Cli {
 
 const A5X_WIDTH: usize = 1404;
 const A5X_HEIGHT: usize = 1872;
-const A5X2_WIDTH: usize = 1920;
-const A5X2_HEIGHT: usize = 2560;
-const A6X2_WIDTH: usize = 1404;
-const A6X2_HEIGHT: usize = 1872;
 
 // precompile regex
 lazy_static! {
@@ -137,16 +135,8 @@ fn detect_device_dimensions(file: &mut File, footer_map: &HashMap<String, String
         && let Ok(header_addr) = header_addr_str.parse::<u64>()
     {
         let header_map = parse_metadata_block(file, header_addr)?;
-        if let Some(equipment) = header_map.get("APPLY_EQUIPMENT") {
-            return match equipment.as_str() {
-                // A5 X2 (Manta)
-                "N5" => Ok((A5X2_WIDTH, A5X2_HEIGHT)),
-                // A6 X2 (Nomad)
-                "N6" => Ok((A6X2_WIDTH, A6X2_HEIGHT)),
-                // A5X / A6X and fallback devices currently share this size.
-                _ => Ok((A5X_WIDTH, A5X_HEIGHT)),
-            };
-        }
+        let profile = resolve_device_profile(header_map.get("APPLY_EQUIPMENT").map(String::as_str));
+        return Ok((profile.width, profile.height));
     }
     Ok((A5X_WIDTH, A5X_HEIGHT))
 }
