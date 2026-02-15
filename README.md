@@ -77,6 +77,16 @@ The CLI is simple, requiring an input path and an output path.
 supernote_pdf -i <input-path> -o <output-path>
 ```
 
+Advanced parser behavior:
+
+```bash
+supernote_pdf -i <input-path> -o <output-path> --policy strict
+supernote_pdf -i <input-path> -o <output-path> --policy loose
+```
+
+- `strict` (default): rejects unknown `.note` signatures.
+- `loose`: attempts best-effort parsing for unknown signatures.
+
 ### Example 1: Convert a Single File
 
 To convert a single `.note` file to a `.pdf` file:

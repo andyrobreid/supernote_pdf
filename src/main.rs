@@ -1,5 +1,5 @@
 use anyhow::{Result, bail};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use flate2::Compression;
 use flate2::write::ZlibEncoder;
 use image::{Rgba, RgbaImage, imageops};
@@ -25,6 +25,16 @@ struct Cli {
     /// Output file (.pdf) or directory
     #[arg(short, long)]
     output: PathBuf,
+
+    /// Signature policy for note parsing
+    #[arg(long, value_enum, default_value_t = ParserPolicy::Strict)]
+    policy: ParserPolicy,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum ParserPolicy {
+    Strict,
+    Loose,
 }
 const A5X_WIDTH: usize = 1404;
 const A5X_HEIGHT: usize = 1872;
@@ -83,9 +93,46 @@ fn get_signature(file: &mut File) -> Result<String> {
 
     // Convert the bytes into a readable string.
     // since it is an anyhow result, "?" can propagate any type of error back in a generic way.
-    let signature_string = String::from_utf8(signature_bytes)?;
+    let signature_string = String::from_utf8(signature_bytes)?.trim_end_matches('\0').to_string();
 
     Ok(signature_string)
+}
+
+fn is_supported_signature(signature: &str) -> bool {
+    // Known X-series signatures from observed firmware versions.
+    const KNOWN_SIGNATURES: [&str; 11] = [
+        "SN_FILE_VER_20200001",
+        "SN_FILE_VER_20200005",
+        "SN_FILE_VER_20200006",
+        "SN_FILE_VER_20200007",
+        "SN_FILE_VER_20200008",
+        "SN_FILE_VER_20210009",
+        "SN_FILE_VER_20210010",
+        "SN_FILE_VER_20220011",
+        "SN_FILE_VER_20220013",
+        "SN_FILE_VER_20230014",
+        "SN_FILE_VER_20230015",
+    ];
+    KNOWN_SIGNATURES.contains(&signature)
+}
+
+fn validate_signature(signature: &str, policy: ParserPolicy) -> Result<()> {
+    if is_supported_signature(signature) {
+        return Ok(());
+    }
+
+    if policy == ParserPolicy::Loose {
+        eprintln!(
+            "Warning: unsupported signature '{}' detected; continuing due to --policy loose.",
+            signature
+        );
+        return Ok(());
+    }
+
+    bail!(
+        "Unsupported note signature '{}'. Re-run with --policy loose to attempt best-effort parsing.",
+        signature
+    );
 }
 
 /// Reads a metadata block at a given address and parses it into a HashMap.
@@ -143,8 +190,9 @@ fn detect_device_dimensions(file: &mut File, footer_map: &HashMap<String, String
     Ok((A5X_WIDTH, A5X_HEIGHT))
 }
 
-fn parse_notebook(file: &mut File) -> Result<Notebook> {
+fn parse_notebook(file: &mut File, policy: ParserPolicy) -> Result<Notebook> {
     let file_signature = get_signature(file)?;
+    validate_signature(&file_signature, policy)?;
 
     // Get footer address and map
     file.seek(SeekFrom::End(-4))?;
@@ -315,11 +363,11 @@ fn to_rgba(pixel_byte: u8) -> Rgba<u8> {
     }
 }
 
-fn convert_note_to_pdf(input_path: &Path, output_path: &Path) -> Result<()> {
+fn convert_note_to_pdf(input_path: &Path, output_path: &Path, policy: ParserPolicy) -> Result<()> {
     // file handle dropped outside this scope
     let notebook = {
         let mut file = File::open(input_path)?;
-        parse_notebook(&mut file)?
+        parse_notebook(&mut file, policy)?
     };
 
     let width = notebook.width;
@@ -484,7 +532,7 @@ fn convert_note_to_pdf(input_path: &Path, output_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn process_single_file(input_file: &Path, output_file: &Path) -> Result<()> {
+fn process_single_file(input_file: &Path, output_file: &Path, policy: ParserPolicy) -> Result<()> {
     if input_file.extension().map_or(true, |s| s != "note") {
         bail!("Input file '{}' must have a .note extension.", input_file.display());
     }
@@ -509,7 +557,7 @@ fn process_single_file(input_file: &Path, output_file: &Path) -> Result<()> {
     let pb = ProgressBar::new_spinner();
     pb.set_message(format!("Converting {}...", input_file.display()));
 
-    convert_note_to_pdf(input_file, output_file)?;
+    convert_note_to_pdf(input_file, output_file, policy)?;
 
     pb.finish_with_message("Conversion complete!");
     println!(
@@ -522,7 +570,7 @@ fn process_single_file(input_file: &Path, output_file: &Path) -> Result<()> {
     Ok(())
 }
 
-fn process_directory(input_dir: &Path, output_dir: &Path) -> Result<()> {
+fn process_directory(input_dir: &Path, output_dir: &Path, policy: ParserPolicy) -> Result<()> {
     if output_dir.is_file() {
         bail!(
             "Input is a directory, but output '{}' is a file. Please specify an output directory.",
@@ -569,7 +617,7 @@ fn process_directory(input_dir: &Path, output_dir: &Path) -> Result<()> {
             fs::create_dir_all(parent).expect("Failed to create output subdirectory");
         }
 
-        if let Err(e) = convert_note_to_pdf(&input_path, &output_path) {
+        if let Err(e) = convert_note_to_pdf(&input_path, &output_path, policy) {
             pb.println(format!("Failed to convert '{}': {}", input_path.display(), e));
         }
         pb.inc(1);
@@ -589,9 +637,9 @@ fn main() -> Result<()> {
     }
 
     if cli.input.is_dir() {
-        process_directory(&cli.input, &cli.output)?;
+        process_directory(&cli.input, &cli.output, cli.policy)?;
     } else if cli.input.is_file() {
-        process_single_file(&cli.input, &cli.output)?;
+        process_single_file(&cli.input, &cli.output, cli.policy)?;
     } else {
         bail!("Input path '{}' is not a regular file or directory.", cli.input.display());
     }
