@@ -1,4 +1,4 @@
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::Parser;
 use flate2::Compression;
 use flate2::write::ZlibEncoder;
@@ -22,9 +22,13 @@ struct Cli {
     #[arg(short, long)]
     input: PathBuf,
 
-    /// Output file (.pdf) or directory
+    /// Output file (.pdf/.txt) or directory
     #[arg(short, long)]
     output: PathBuf,
+
+    /// Extract recognized text to .txt instead of rendering PDFs
+    #[arg(long, default_value_t = false)]
+    extract_text: bool,
 }
 const A5X_WIDTH: usize = 1404;
 const A5X_HEIGHT: usize = 1872;
@@ -36,6 +40,8 @@ const A6X2_HEIGHT: usize = 1872;
 // precompile regex
 lazy_static! {
     static ref METADATA_RE: Regex = Regex::new(r"<(?P<key>[^:]+?):(?P<value>.*?)>").unwrap();
+    static ref TEXT_OBJECT_RE: Regex = Regex::new(r#"\{[^{}]*"type"\s*:\s*"Text"[^{}]*\}"#).unwrap();
+    static ref LABEL_RE: Regex = Regex::new(r#""label"\s*:\s*"((?:\\.|[^"\\])*)""#).unwrap();
 }
 
 #[derive(Debug)]
@@ -50,6 +56,7 @@ pub struct Notebook {
 pub struct Page {
     pub addr: u64,
     pub layers: Vec<Layer>,
+    pub recognized_text: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -90,24 +97,27 @@ fn get_signature(file: &mut File) -> Result<String> {
 
 /// Reads a metadata block at a given address and parses it into a HashMap.
 /// Metadata format is `<KEY1:VALUE1><KEY2:VALUE2>...`
-fn parse_metadata_block(file: &mut File, address: u64) -> Result<HashMap<String, String>> {
-    // The regex for parsing the key-value format.
-    // It's "lazy" (`*?`) to handle nested or unusual values correctly.
+fn read_block(file: &mut File, address: u64) -> Result<Vec<u8>> {
     if address == 0 {
-        let empty: HashMap<String, String> = HashMap::new();
-        return Ok(empty);
+        return Ok(Vec::new());
     }
-
     file.seek(SeekFrom::Start(address))?;
 
-    // Read the 4-byte block length
     let mut len_bytes = [0u8; 4];
     file.read_exact(&mut len_bytes)?;
     let block_len = u32::from_le_bytes(len_bytes) as usize;
 
-    // Read the block content
     let mut content_bytes = vec![0; block_len];
     file.read_exact(&mut content_bytes)?;
+    Ok(content_bytes)
+}
+
+fn parse_metadata_block(file: &mut File, address: u64) -> Result<HashMap<String, String>> {
+    let content_bytes = read_block(file, address)?;
+    if content_bytes.is_empty() {
+        let empty: HashMap<String, String> = HashMap::new();
+        return Ok(empty);
+    }
     let content = String::from_utf8(content_bytes)?;
 
     // Use the regex to find all key-value pairs and collect them into a map.
@@ -123,21 +133,143 @@ fn parse_metadata_block(file: &mut File, address: u64) -> Result<HashMap<String,
     Ok(map)
 }
 
+fn decode_base64(input: &str) -> Result<Vec<u8>> {
+    let mut cleaned = String::with_capacity(input.len());
+    for ch in input.chars() {
+        if !ch.is_whitespace() {
+            cleaned.push(match ch {
+                '-' => '+',
+                '_' => '/',
+                other => other,
+            });
+        }
+    }
+
+    while !cleaned.len().is_multiple_of(4) {
+        cleaned.push('=');
+    }
+
+    let mut out = Vec::with_capacity((cleaned.len() / 4) * 3);
+    for chunk in cleaned.as_bytes().chunks(4) {
+        let mut vals = [0u8; 4];
+        let mut pad = 0usize;
+        for (i, &b) in chunk.iter().enumerate() {
+            vals[i] = match b {
+                b'A'..=b'Z' => b - b'A',
+                b'a'..=b'z' => b - b'a' + 26,
+                b'0'..=b'9' => b - b'0' + 52,
+                b'+' => 62,
+                b'/' => 63,
+                b'=' => {
+                    pad += 1;
+                    0
+                }
+                _ => bail!("invalid base64 character in RECOGNTEXT payload"),
+            };
+        }
+
+        let n = ((vals[0] as u32) << 18) | ((vals[1] as u32) << 12) | ((vals[2] as u32) << 6) | (vals[3] as u32);
+        out.push(((n >> 16) & 0xff) as u8);
+        if pad < 2 {
+            out.push(((n >> 8) & 0xff) as u8);
+        }
+        if pad == 0 {
+            out.push((n & 0xff) as u8);
+        }
+    }
+
+    Ok(out)
+}
+
+fn unescape_json_string(input: &str) -> Option<String> {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            out.push(ch);
+            continue;
+        }
+
+        let escaped = chars.next()?;
+        match escaped {
+            '"' => out.push('"'),
+            '\\' => out.push('\\'),
+            '/' => out.push('/'),
+            'b' => out.push('\u{0008}'),
+            'f' => out.push('\u{000C}'),
+            'n' => out.push('\n'),
+            'r' => out.push('\r'),
+            't' => out.push('\t'),
+            'u' => {
+                let code_hex: String = chars.by_ref().take(4).collect();
+                if code_hex.len() != 4 {
+                    return None;
+                }
+                let code = u16::from_str_radix(&code_hex, 16).ok()?;
+                let ch = char::from_u32(code as u32)?;
+                out.push(ch);
+            }
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
+fn parse_recognition_payload(payload: &str) -> Result<Option<String>> {
+    let trimmed = payload.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+
+    let decoded = decode_base64(trimmed).context("failed to decode RECOGNTEXT payload")?;
+    let json = String::from_utf8(decoded).context("RECOGNTEXT JSON payload is not valid UTF-8")?;
+
+    let mut labels: Vec<String> = TEXT_OBJECT_RE
+        .find_iter(&json)
+        .filter_map(|obj| LABEL_RE.captures(obj.as_str()))
+        .filter_map(|caps| caps.get(1).map(|m| m.as_str()))
+        .filter_map(unescape_json_string)
+        .map(|label| label.trim().to_string())
+        .filter(|label| !label.is_empty())
+        .collect();
+
+    if labels.is_empty() {
+        labels = LABEL_RE
+            .captures_iter(&json)
+            .filter_map(|caps| caps.get(1).map(|m| m.as_str()))
+            .filter_map(unescape_json_string)
+            .map(|label| label.trim().to_string())
+            .filter(|label| !label.is_empty())
+            .collect();
+    }
+
+    if labels.is_empty() { Ok(None) } else { Ok(Some(labels.join("\n"))) }
+}
+
+fn parse_recognized_text(file: &mut File, address: u64) -> Result<Option<String>> {
+    let payload = read_block(file, address)?;
+    if payload.is_empty() {
+        return Ok(None);
+    }
+    let payload = String::from_utf8(payload).with_context(|| format!("RECOGNTEXT block at address {address} is not valid UTF-8"))?;
+    parse_recognition_payload(&payload).with_context(|| format!("failed parsing RECOGNTEXT block at address {address}"))
+}
+
 /// Detects the device type and returns the appropriate width and height dimensions
 fn detect_device_dimensions(file: &mut File, footer_map: &HashMap<String, String>) -> Result<(usize, usize)> {
-    if let Some(header_addr_str) = footer_map.get("FILE_FEATURE") {
-        if let Ok(header_addr) = header_addr_str.parse::<u64>() {
-            let header_map = parse_metadata_block(file, header_addr)?;
-            if let Some(equipment) = header_map.get("APPLY_EQUIPMENT") {
-                return match equipment.as_str() {
-                    // A5 X2 (Manta)
-                    "N5" => Ok((A5X2_WIDTH, A5X2_HEIGHT)),
-                    // A6 X2 (Nomad)
-                    "N6" => Ok((A6X2_WIDTH, A6X2_HEIGHT)),
-                    // A5X / A6X and fallback devices currently share this size.
-                    _ => Ok((A5X_WIDTH, A5X_HEIGHT)),
-                };
-            }
+    if let Some(header_addr_str) = footer_map.get("FILE_FEATURE")
+        && let Ok(header_addr) = header_addr_str.parse::<u64>()
+    {
+        let header_map = parse_metadata_block(file, header_addr)?;
+        if let Some(equipment) = header_map.get("APPLY_EQUIPMENT") {
+            return match equipment.as_str() {
+                // A5 X2 (Manta)
+                "N5" => Ok((A5X2_WIDTH, A5X2_HEIGHT)),
+                // A6 X2 (Nomad)
+                "N6" => Ok((A6X2_WIDTH, A6X2_HEIGHT)),
+                // A5X / A6X and fallback devices currently share this size.
+                _ => Ok((A5X_WIDTH, A5X_HEIGHT)),
+            };
         }
     }
     Ok((A5X_WIDTH, A5X_HEIGHT))
@@ -171,6 +303,13 @@ fn parse_notebook(file: &mut File) -> Result<Notebook> {
     let mut pages: Vec<Page> = Vec::new();
     for addr in page_addrs {
         let page_map = parse_metadata_block(file, addr)?;
+        let recognized_text = page_map
+            .get("RECOGNTEXT")
+            .and_then(|s| s.parse::<u64>().ok())
+            .filter(|addr| *addr > 0)
+            .map(|text_addr| parse_recognized_text(file, text_addr))
+            .transpose()?
+            .flatten();
         let layer_order = page_map
             .get("LAYERSEQ")
             .map(|s| s.split(',').map(String::from).collect())
@@ -197,12 +336,16 @@ fn parse_notebook(file: &mut File) -> Result<Notebook> {
                 });
             }
         }
-        pages.push(Page { addr: addr, layers: layers });
+        pages.push(Page {
+            addr,
+            layers,
+            recognized_text,
+        });
     }
 
     Ok(Notebook {
         signature: file_signature,
-        pages: pages,
+        pages,
         width,
         height,
     })
@@ -245,12 +388,12 @@ fn decode_rle(compressed_data: &[u8], width: usize, height: usize) -> Result<Vec
                 // The colors match, so combine the lengths.
                 let length = 1 + length_code as usize + (((prev_length_code & 0x7f) as usize + 1) << 7);
                 // Combined run belongs to `color_code`.
-                decompressed.extend(std::iter::repeat(color_code).take(length));
+                decompressed.extend(std::iter::repeat_n(color_code, length));
                 emit_current = false;
             } else {
                 // Colors don't match. First, process the held-over length.
                 let held_length = ((prev_length_code & 0x7f) as usize + 1) << 7;
-                decompressed.extend(std::iter::repeat(prev_color_code).take(held_length));
+                decompressed.extend(std::iter::repeat_n(prev_color_code, held_length));
             }
         }
 
@@ -268,7 +411,7 @@ fn decode_rle(compressed_data: &[u8], width: usize, height: usize) -> Result<Vec
                 // Standard case: length is just length_code + 1.
                 length = length_code as usize + 1;
             }
-            decompressed.extend(std::iter::repeat(color_code).take(length));
+            decompressed.extend(std::iter::repeat_n(color_code, length));
         }
     }
 
@@ -277,7 +420,7 @@ fn decode_rle(compressed_data: &[u8], width: usize, height: usize) -> Result<Vec
     if let Some((color_code, length_code)) = holder {
         let tail_length = adjust_rle_tail_length(length_code, decompressed.len(), expected_len);
         if tail_length > 0 {
-            decompressed.extend(std::iter::repeat(color_code).take(tail_length));
+            decompressed.extend(std::iter::repeat_n(color_code, tail_length));
         }
     }
 
@@ -313,6 +456,38 @@ fn to_rgba(pixel_byte: u8) -> Rgba<u8> {
             Rgba([pixel_byte, pixel_byte, pixel_byte, 255])
         }
     }
+}
+
+fn notebook_to_text(notebook: &Notebook) -> String {
+    let mut lines = Vec::new();
+    for (index, page) in notebook.pages.iter().enumerate() {
+        lines.push(format!("--- Page {} ---", index + 1));
+        if let Some(text) = page.recognized_text.as_deref() {
+            let trimmed = text.trim();
+            if !trimmed.is_empty() {
+                lines.push(trimmed.to_string());
+            }
+        }
+    }
+    if lines.is_empty() {
+        String::new()
+    } else {
+        format!("{}\n", lines.join("\n\n"))
+    }
+}
+
+fn extract_note_text(input_path: &Path, output_path: &Path) -> Result<()> {
+    let notebook = {
+        let mut file = File::open(input_path)?;
+        parse_notebook(&mut file)?
+    };
+    let text = notebook_to_text(&notebook);
+
+    let out_file = File::create(output_path)?;
+    let mut writer = BufWriter::new(out_file);
+    writer.write_all(text.as_bytes())?;
+    writer.flush()?;
+    Ok(())
 }
 
 fn convert_note_to_pdf(input_path: &Path, output_path: &Path) -> Result<()> {
@@ -484,8 +659,8 @@ fn convert_note_to_pdf(input_path: &Path, output_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn process_single_file(input_file: &Path, output_file: &Path) -> Result<()> {
-    if input_file.extension().map_or(true, |s| s != "note") {
+fn process_single_file(input_file: &Path, output_file: &Path, extract_text: bool) -> Result<()> {
+    if input_file.extension().is_none_or(|s| s != "note") {
         bail!("Input file '{}' must have a .note extension.", input_file.display());
     }
     if output_file.is_dir() {
@@ -494,8 +669,9 @@ fn process_single_file(input_file: &Path, output_file: &Path) -> Result<()> {
             output_file.display()
         );
     }
-    if output_file.extension().map_or(true, |s| s != "pdf") {
-        bail!("Output file '{}' must have a .pdf extension.", output_file.display());
+    let expected_output_ext = if extract_text { "txt" } else { "pdf" };
+    if output_file.extension().is_none_or(|s| s != expected_output_ext) {
+        bail!("Output file '{}' must have a .{} extension.", output_file.display(), expected_output_ext);
     }
     if output_file.exists() {
         bail!(
@@ -504,16 +680,30 @@ fn process_single_file(input_file: &Path, output_file: &Path) -> Result<()> {
         );
     }
 
-    println!("Converting single file...");
+    if extract_text {
+        println!("Extracting recognized text from single file...");
+    } else {
+        println!("Converting single file...");
+    }
     let start = Instant::now();
     let pb = ProgressBar::new_spinner();
-    pb.set_message(format!("Converting {}...", input_file.display()));
+    let action = if extract_text { "Extracting text from" } else { "Converting" };
+    pb.set_message(format!("{action} {}...", input_file.display()));
 
-    convert_note_to_pdf(input_file, output_file)?;
+    if extract_text {
+        extract_note_text(input_file, output_file)?;
+    } else {
+        convert_note_to_pdf(input_file, output_file)?;
+    }
 
-    pb.finish_with_message("Conversion complete!");
+    let done_message = if extract_text {
+        "Text extraction complete!"
+    } else {
+        "Conversion complete!"
+    };
+    pb.finish_with_message(done_message);
     println!(
-        "Successfully converted '{}' to '{}' in {:?}",
+        "Successfully processed '{}' to '{}' in {:?}",
         input_file.display(),
         output_file.display(),
         start.elapsed()
@@ -522,7 +712,7 @@ fn process_single_file(input_file: &Path, output_file: &Path) -> Result<()> {
     Ok(())
 }
 
-fn process_directory(input_dir: &Path, output_dir: &Path) -> Result<()> {
+fn process_directory(input_dir: &Path, output_dir: &Path, extract_text: bool) -> Result<()> {
     if output_dir.is_file() {
         bail!(
             "Input is a directory, but output '{}' is a file. Please specify an output directory.",
@@ -541,13 +731,13 @@ fn process_directory(input_dir: &Path, output_dir: &Path) -> Result<()> {
     let jobs: Vec<(PathBuf, PathBuf)> = WalkDir::new(input_dir)
         .into_iter()
         .filter_map(Result::ok) // Ignore errors during walk
-        .filter(|e| e.file_type().is_file() && e.path().extension().map_or(false, |s| s == "note"))
+        .filter(|e| e.file_type().is_file() && e.path().extension().is_some_and(|s| s == "note"))
         .map(|entry| {
             let input_path = entry.into_path();
             // Create the corresponding output path by mirroring the directory structure
             let relative_path = input_path.strip_prefix(input_dir).expect("Path from WalkDir should have a known prefix");
             let mut output_path = output_dir.join(relative_path);
-            output_path.set_extension("pdf");
+            output_path.set_extension(if extract_text { "txt" } else { "pdf" });
             (input_path, output_path)
         })
         .collect();
@@ -558,25 +748,44 @@ fn process_directory(input_dir: &Path, output_dir: &Path) -> Result<()> {
     }
 
     let num_jobs = jobs.len();
-    println!("Found {} files to convert. Starting conversion...", num_jobs);
+    if extract_text {
+        println!("Found {} files to extract text from. Starting extraction...", num_jobs);
+    } else {
+        println!("Found {} files to convert. Starting conversion...", num_jobs);
+    }
     let start = Instant::now();
 
     let pb = ProgressBar::new(num_jobs as u64);
     jobs.into_par_iter().for_each(|(input_path, output_path)| {
         let file_name = input_path.file_name().unwrap_or_default().to_string_lossy();
-        pb.set_message(format!("Converting {}...", file_name));
+        let action = if extract_text { "Extracting text from" } else { "Converting" };
+        pb.set_message(format!("{action} {}...", file_name));
         if let Some(parent) = output_path.parent() {
             fs::create_dir_all(parent).expect("Failed to create output subdirectory");
         }
 
-        if let Err(e) = convert_note_to_pdf(&input_path, &output_path) {
-            pb.println(format!("Failed to convert '{}': {}", input_path.display(), e));
+        let result = if extract_text {
+            extract_note_text(&input_path, &output_path)
+        } else {
+            convert_note_to_pdf(&input_path, &output_path)
+        };
+        if let Err(e) = result {
+            pb.println(format!("Failed to process '{}': {}", input_path.display(), e));
         }
         pb.inc(1);
     });
 
-    pb.finish_with_message("All files converted!");
-    println!("Converted {} files in {:?}", num_jobs, start.elapsed());
+    let done_message = if extract_text {
+        "All text files extracted!"
+    } else {
+        "All files converted!"
+    };
+    pb.finish_with_message(done_message);
+    if extract_text {
+        println!("Extracted text from {} files in {:?}", num_jobs, start.elapsed());
+    } else {
+        println!("Converted {} files in {:?}", num_jobs, start.elapsed());
+    }
 
     Ok(())
 }
@@ -589,12 +798,38 @@ fn main() -> Result<()> {
     }
 
     if cli.input.is_dir() {
-        process_directory(&cli.input, &cli.output)?;
+        process_directory(&cli.input, &cli.output, cli.extract_text)?;
     } else if cli.input.is_file() {
-        process_single_file(&cli.input, &cli.output)?;
+        process_single_file(&cli.input, &cli.output, cli.extract_text)?;
     } else {
         bail!("Input path '{}' is not a regular file or directory.", cli.input.display());
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{decode_base64, parse_recognition_payload};
+
+    #[test]
+    fn parse_recognition_payload_extracts_text_elements() {
+        let payload = "eyJlbGVtZW50cyI6W3sidHlwZSI6IlRleHQiLCJsYWJlbCI6IkxpbmUgb25lIn0seyJ0eXBlIjoiU2hhcGUiLCJsYWJlbCI6Imlnbm9yZSBtZSJ9LHsidHlwZSI6IlRleHQiLCJsYWJlbCI6IkxpbmUgdHdvIn1dfQ==";
+        let parsed = parse_recognition_payload(payload).expect("payload should parse");
+        assert_eq!(parsed.as_deref(), Some("Line one\nLine two"));
+    }
+
+    #[test]
+    fn parse_recognition_payload_falls_back_to_any_labels() {
+        let payload = "eyJlbGVtZW50cyI6W3sidHlwZSI6IlNoYXBlIiwibGFiZWwiOiJ4In1dfQ==";
+        let parsed = parse_recognition_payload(payload).expect("payload should parse");
+        assert_eq!(parsed.as_deref(), Some("x"));
+        assert_eq!(parse_recognition_payload("   ").expect("blank should parse"), None);
+    }
+
+    #[test]
+    fn decode_base64_supports_urlsafe_without_padding() {
+        let decoded = decode_base64("SGVsbG8td29ybGQ").expect("urlsafe should decode");
+        assert_eq!(decoded, b"Hello-world");
+    }
 }

@@ -20,6 +20,7 @@ This tool is designed for one thing: converting Supernote `.note` files to PDF a
 - **🚀 Blazing Fast:** Asynchronously decodes pages and processes entire folders in parallel. See [Benchmarks](#-benchmarks) for details.
 - **📂 Directory Conversion:** Converts an entire folder of `.note` files, perfectly preserving the original directory structure.
 - **💻 Simple & Powerful CLI:** A straightforward command-line interface for single-file or batch conversions.
+- **📝 Text Extraction:** Optional OCR-text extraction mode for notes with Supernote recognition data (`RECOGNTEXT`), outputting `.txt`.
 - **🔧 Optimized for Archival:** Creates PDFs with embedded images, keeping file sizes small and conversion times low for densely written notes.
 - **✅ Robust:** Includes safety checks to prevent accidental data loss (e.g., won't overwrite an existing output directory).
 
@@ -77,6 +78,8 @@ The CLI is simple, requiring an input path and an output path.
 supernote_pdf -i <input-path> -o <output-path>
 ```
 
+To extract recognized text instead of generating a PDF, add `--extract-text` and use a `.txt` output.
+
 ### Example 1: Convert a Single File
 
 To convert a single `.note` file to a `.pdf` file:
@@ -96,6 +99,20 @@ supernote_pdf -i path/to/your/Note_folder -o path/to/your/Note_PDFs
 The tool will scan for all `.note` files in the input directory, recreate the folder structure in the output directory, and convert every file.
 
 **Note:** For safety, the output directory must not already exist. This prevents you from accidentally overwriting previous backups.
+
+### Example 3: Extract Text from a Single File
+
+```bash
+supernote_pdf -i "My Notes/Meeting Agenda.note" -o "Archive/Meeting Agenda.txt" --extract-text
+```
+
+### Example 4: Extract Text from an Entire Directory
+
+```bash
+supernote_pdf -i path/to/your/Note_folder -o path/to/your/Note_Text --extract-text
+```
+
+This mirrors the source directory structure and writes one `.txt` file per `.note` file.
 
 ## 📊 Benchmarks
 
