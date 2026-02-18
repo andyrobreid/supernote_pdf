@@ -29,6 +29,10 @@ struct Cli {
     /// Extract recognized text to .txt instead of rendering PDFs
     #[arg(long, default_value_t = false)]
     extract_text: bool,
+
+    /// Generate both .pdf and .md outputs for each .note (cannot be used with --extract-text)
+    #[arg(long, default_value_t = false, conflicts_with = "extract_text")]
+    pdf_and_markdown: bool,
 }
 const A5X_WIDTH: usize = 1404;
 const A5X_HEIGHT: usize = 1872;
@@ -476,6 +480,35 @@ fn notebook_to_text(notebook: &Notebook) -> String {
     }
 }
 
+fn notebook_to_markdown(input_path: &Path, notebook: &Notebook) -> String {
+    let title = input_path
+        .file_stem()
+        .or_else(|| input_path.file_name())
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "Untitled".to_string());
+
+    let mut lines = vec![format!("# {title}")];
+    for (index, page) in notebook.pages.iter().enumerate() {
+        lines.push(format!("## Page {}", index + 1));
+        if let Some(text) = page.recognized_text.as_deref() {
+            let trimmed = text.trim();
+            if !trimmed.is_empty() {
+                lines.push(trimmed.to_string());
+                continue;
+            }
+        }
+        lines.push("_No recognized text found._".to_string());
+    }
+
+    format!("{}\n", lines.join("\n\n"))
+}
+
+fn markdown_output_for_pdf_path(output_pdf_path: &Path) -> PathBuf {
+    let mut markdown_path = output_pdf_path.to_path_buf();
+    markdown_path.set_extension("md");
+    markdown_path
+}
+
 fn extract_note_text(input_path: &Path, output_path: &Path) -> Result<()> {
     let notebook = {
         let mut file = File::open(input_path)?;
@@ -486,6 +519,20 @@ fn extract_note_text(input_path: &Path, output_path: &Path) -> Result<()> {
     let out_file = File::create(output_path)?;
     let mut writer = BufWriter::new(out_file);
     writer.write_all(text.as_bytes())?;
+    writer.flush()?;
+    Ok(())
+}
+
+fn extract_note_markdown(input_path: &Path, output_path: &Path) -> Result<()> {
+    let notebook = {
+        let mut file = File::open(input_path)?;
+        parse_notebook(&mut file)?
+    };
+    let markdown = notebook_to_markdown(input_path, &notebook);
+
+    let out_file = File::create(output_path)?;
+    let mut writer = BufWriter::new(out_file);
+    writer.write_all(markdown.as_bytes())?;
     writer.flush()?;
     Ok(())
 }
@@ -659,7 +706,7 @@ fn convert_note_to_pdf(input_path: &Path, output_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn process_single_file(input_file: &Path, output_file: &Path, extract_text: bool) -> Result<()> {
+fn process_single_file(input_file: &Path, output_file: &Path, extract_text: bool, pdf_and_markdown: bool) -> Result<()> {
     if input_file.extension().is_none_or(|s| s != "note") {
         bail!("Input file '{}' must have a .note extension.", input_file.display());
     }
@@ -679,40 +726,80 @@ fn process_single_file(input_file: &Path, output_file: &Path, extract_text: bool
             output_file.display()
         );
     }
+    let markdown_file = if pdf_and_markdown {
+        let markdown_file = markdown_output_for_pdf_path(output_file);
+        if markdown_file.exists() {
+            bail!(
+                "Markdown output file '{}' already exists. Please remove it or choose a different output PDF path.",
+                markdown_file.display()
+            );
+        }
+        Some(markdown_file)
+    } else {
+        None
+    };
 
     if extract_text {
         println!("Extracting recognized text from single file...");
+    } else if pdf_and_markdown {
+        println!("Converting single file and generating markdown...");
     } else {
         println!("Converting single file...");
     }
     let start = Instant::now();
     let pb = ProgressBar::new_spinner();
-    let action = if extract_text { "Extracting text from" } else { "Converting" };
+    let action = if extract_text {
+        "Extracting text from"
+    } else if pdf_and_markdown {
+        "Converting and extracting text from"
+    } else {
+        "Converting"
+    };
     pb.set_message(format!("{action} {}...", input_file.display()));
 
     if extract_text {
         extract_note_text(input_file, output_file)?;
+    } else if pdf_and_markdown {
+        convert_note_to_pdf(input_file, output_file)?;
+        extract_note_markdown(
+            input_file,
+            markdown_file
+                .as_deref()
+                .expect("markdown output path should be set when --pdf-and-markdown is enabled"),
+        )?;
     } else {
         convert_note_to_pdf(input_file, output_file)?;
     }
 
     let done_message = if extract_text {
         "Text extraction complete!"
+    } else if pdf_and_markdown {
+        "PDF and markdown generation complete!"
     } else {
         "Conversion complete!"
     };
     pb.finish_with_message(done_message);
-    println!(
-        "Successfully processed '{}' to '{}' in {:?}",
-        input_file.display(),
-        output_file.display(),
-        start.elapsed()
-    );
+    if let Some(markdown_file) = markdown_file {
+        println!(
+            "Successfully processed '{}' to '{}' and '{}' in {:?}",
+            input_file.display(),
+            output_file.display(),
+            markdown_file.display(),
+            start.elapsed()
+        );
+    } else {
+        println!(
+            "Successfully processed '{}' to '{}' in {:?}",
+            input_file.display(),
+            output_file.display(),
+            start.elapsed()
+        );
+    }
 
     Ok(())
 }
 
-fn process_directory(input_dir: &Path, output_dir: &Path, extract_text: bool) -> Result<()> {
+fn process_directory(input_dir: &Path, output_dir: &Path, extract_text: bool, pdf_and_markdown: bool) -> Result<()> {
     if output_dir.is_file() {
         bail!(
             "Input is a directory, but output '{}' is a file. Please specify an output directory.",
@@ -750,6 +837,8 @@ fn process_directory(input_dir: &Path, output_dir: &Path, extract_text: bool) ->
     let num_jobs = jobs.len();
     if extract_text {
         println!("Found {} files to extract text from. Starting extraction...", num_jobs);
+    } else if pdf_and_markdown {
+        println!("Found {} files to convert and generate markdown for. Starting processing...", num_jobs);
     } else {
         println!("Found {} files to convert. Starting conversion...", num_jobs);
     }
@@ -758,7 +847,13 @@ fn process_directory(input_dir: &Path, output_dir: &Path, extract_text: bool) ->
     let pb = ProgressBar::new(num_jobs as u64);
     jobs.into_par_iter().for_each(|(input_path, output_path)| {
         let file_name = input_path.file_name().unwrap_or_default().to_string_lossy();
-        let action = if extract_text { "Extracting text from" } else { "Converting" };
+        let action = if extract_text {
+            "Extracting text from"
+        } else if pdf_and_markdown {
+            "Converting and extracting text from"
+        } else {
+            "Converting"
+        };
         pb.set_message(format!("{action} {}...", file_name));
         if let Some(parent) = output_path.parent() {
             fs::create_dir_all(parent).expect("Failed to create output subdirectory");
@@ -766,6 +861,11 @@ fn process_directory(input_dir: &Path, output_dir: &Path, extract_text: bool) ->
 
         let result = if extract_text {
             extract_note_text(&input_path, &output_path)
+        } else if pdf_and_markdown {
+            convert_note_to_pdf(&input_path, &output_path).and_then(|_| {
+                let markdown_path = markdown_output_for_pdf_path(&output_path);
+                extract_note_markdown(&input_path, &markdown_path)
+            })
         } else {
             convert_note_to_pdf(&input_path, &output_path)
         };
@@ -777,12 +877,16 @@ fn process_directory(input_dir: &Path, output_dir: &Path, extract_text: bool) ->
 
     let done_message = if extract_text {
         "All text files extracted!"
+    } else if pdf_and_markdown {
+        "All PDF and markdown files generated!"
     } else {
         "All files converted!"
     };
     pb.finish_with_message(done_message);
     if extract_text {
         println!("Extracted text from {} files in {:?}", num_jobs, start.elapsed());
+    } else if pdf_and_markdown {
+        println!("Converted and generated markdown for {} files in {:?}", num_jobs, start.elapsed());
     } else {
         println!("Converted {} files in {:?}", num_jobs, start.elapsed());
     }
@@ -798,9 +902,9 @@ fn main() -> Result<()> {
     }
 
     if cli.input.is_dir() {
-        process_directory(&cli.input, &cli.output, cli.extract_text)?;
+        process_directory(&cli.input, &cli.output, cli.extract_text, cli.pdf_and_markdown)?;
     } else if cli.input.is_file() {
-        process_single_file(&cli.input, &cli.output, cli.extract_text)?;
+        process_single_file(&cli.input, &cli.output, cli.extract_text, cli.pdf_and_markdown)?;
     } else {
         bail!("Input path '{}' is not a regular file or directory.", cli.input.display());
     }
@@ -810,7 +914,8 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_base64, parse_recognition_payload};
+    use super::{Notebook, Page, decode_base64, markdown_output_for_pdf_path, notebook_to_markdown, parse_recognition_payload};
+    use std::path::Path;
 
     #[test]
     fn parse_recognition_payload_extracts_text_elements() {
@@ -831,5 +936,38 @@ mod tests {
     fn decode_base64_supports_urlsafe_without_padding() {
         let decoded = decode_base64("SGVsbG8td29ybGQ").expect("urlsafe should decode");
         assert_eq!(decoded, b"Hello-world");
+    }
+
+    #[test]
+    fn notebook_to_markdown_includes_title_and_page_sections() {
+        let notebook = Notebook {
+            signature: "SN_FILE_VER_20230015".to_string(),
+            pages: vec![
+                Page {
+                    addr: 1,
+                    layers: vec![],
+                    recognized_text: Some("Line one\nLine two".to_string()),
+                },
+                Page {
+                    addr: 2,
+                    layers: vec![],
+                    recognized_text: None,
+                },
+            ],
+            width: 1404,
+            height: 1872,
+        };
+
+        let markdown = notebook_to_markdown(Path::new("My Notes/Meeting Agenda.note"), &notebook);
+        assert_eq!(
+            markdown,
+            "# Meeting Agenda\n\n## Page 1\n\nLine one\nLine two\n\n## Page 2\n\n_No recognized text found._\n"
+        );
+    }
+
+    #[test]
+    fn markdown_output_for_pdf_path_replaces_extension() {
+        let markdown_path = markdown_output_for_pdf_path(Path::new("output/subdir/note.pdf"));
+        assert_eq!(markdown_path, Path::new("output/subdir/note.md"));
     }
 }

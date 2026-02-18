@@ -21,6 +21,7 @@ This tool is designed for one thing: converting Supernote `.note` files to PDF a
 - **📂 Directory Conversion:** Converts an entire folder of `.note` files, perfectly preserving the original directory structure.
 - **💻 Simple & Powerful CLI:** A straightforward command-line interface for single-file or batch conversions.
 - **📝 Text Extraction:** Optional OCR-text extraction mode for notes with Supernote recognition data (`RECOGNTEXT`), outputting `.txt`.
+- **📄+📝 PDF and Markdown Mode:** Optional mode to generate both `.pdf` and `.md` per note in one run.
 - **🔧 Optimized for Archival:** Creates PDFs with embedded images, keeping file sizes small and conversion times low for densely written notes.
 - **✅ Robust:** Includes safety checks to prevent accidental data loss (e.g., won't overwrite an existing output directory).
 
@@ -80,6 +81,8 @@ supernote_pdf -i <input-path> -o <output-path>
 
 To extract recognized text instead of generating a PDF, add `--extract-text` and use a `.txt` output.
 
+To generate both a PDF and a Markdown file per note, add `--pdf-and-markdown`. This mode writes PDFs as normal and writes Markdown from `RECOGNTEXT` data without embedding text into the PDF.
+
 ### Example 1: Convert a Single File
 
 To convert a single `.note` file to a `.pdf` file:
@@ -113,6 +116,24 @@ supernote_pdf -i path/to/your/Note_folder -o path/to/your/Note_Text --extract-te
 ```
 
 This mirrors the source directory structure and writes one `.txt` file per `.note` file.
+
+### Example 5: Generate PDF + Markdown from a Single File
+
+```bash
+supernote_pdf -i "My Notes/Meeting Agenda.note" -o "Archive/Meeting Agenda.pdf" --pdf-and-markdown
+```
+
+This writes:
+- `Archive/Meeting Agenda.pdf`
+- `Archive/Meeting Agenda.md`
+
+### Example 6: Generate PDF + Markdown from an Entire Directory
+
+```bash
+supernote_pdf -i path/to/your/Note_folder -o path/to/your/Note_PDFs --pdf-and-markdown
+```
+
+This mirrors the source directory structure and writes `.pdf` and `.md` sibling files for each `.note`.
 
 ## 📊 Benchmarks
 
