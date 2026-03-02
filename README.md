@@ -81,7 +81,9 @@ supernote_pdf -i <input-path> -o <output-path>
 
 To extract recognized text instead of generating a PDF, add `--extract-text` and use a `.txt` output.
 
-To generate both a PDF and a Markdown file per note, add `--pdf-and-markdown`. This mode writes PDFs as normal and writes Markdown from `RECOGNTEXT` data without embedding text into the PDF.
+To generate both a PDF and a Markdown file per note, add `--pdf-and-markdown`. This mode writes PDFs as normal and writes Obsidian-friendly Markdown with Supernote metadata, PDF wikilink attachment, and recognized text (`RECOGNTEXT`) in a `## Text` section.
+
+If you want cleaner paragraph text in markdown, add `--normalize-text-whitespace` (requires `--pdf-and-markdown`). This converts single newlines to spaces while preserving paragraph breaks (double newlines).
 
 ### Example 1: Convert a Single File
 
@@ -134,6 +136,12 @@ supernote_pdf -i path/to/your/Note_folder -o path/to/your/Note_PDFs --pdf-and-ma
 ```
 
 This mirrors the source directory structure and writes `.pdf` and `.md` sibling files for each `.note`.
+
+### Example 7: Generate PDF + Markdown with paragraph-normalized text
+
+```bash
+supernote_pdf -i "My Notes/Meeting Agenda.note" -o "Archive/Meeting Agenda.pdf" --pdf-and-markdown --normalize-text-whitespace
+```
 
 ## 📊 Benchmarks
 

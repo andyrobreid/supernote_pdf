@@ -33,6 +33,11 @@ struct Cli {
     /// Generate both .pdf and .md outputs for each .note (cannot be used with --extract-text)
     #[arg(long, default_value_t = false, conflicts_with = "extract_text")]
     pdf_and_markdown: bool,
+
+    /// Normalize recognized text whitespace in markdown output: single newlines become spaces,
+    /// paragraph breaks (double newlines) are preserved
+    #[arg(long, default_value_t = false, requires = "pdf_and_markdown")]
+    normalize_text_whitespace: bool,
 }
 const A5X_WIDTH: usize = 1404;
 const A5X_HEIGHT: usize = 1872;
@@ -54,6 +59,7 @@ pub struct Notebook {
     pub pages: Vec<Page>,
     pub width: usize,
     pub height: usize,
+    pub metadata: HashMap<String, String>,
 }
 
 #[derive(Debug)]
@@ -352,6 +358,7 @@ fn parse_notebook(file: &mut File) -> Result<Notebook> {
         pages,
         width,
         height,
+        metadata: footer_map,
     })
 }
 
@@ -462,45 +469,136 @@ fn to_rgba(pixel_byte: u8) -> Rgba<u8> {
     }
 }
 
-fn notebook_to_text(notebook: &Notebook) -> String {
-    let mut lines = Vec::new();
-    for (index, page) in notebook.pages.iter().enumerate() {
-        lines.push(format!("--- Page {} ---", index + 1));
-        if let Some(text) = page.recognized_text.as_deref() {
-            let trimmed = text.trim();
+fn stable_supernote_id(source_path: &str) -> String {
+    let mut hash: i64 = 0;
+    for byte in source_path.bytes() {
+        hash = ((hash << 5) - hash) + byte as i64;
+        hash &= 0xffff_ffff;
+    }
+    format!("sn-{:x}", hash.unsigned_abs())
+}
+
+fn format_file_size(bytes: u64) -> String {
+    if bytes < 1024 {
+        return format!("{} B", bytes);
+    }
+    if bytes < 1024 * 1024 {
+        return format!("{:.1} KB", bytes as f64 / 1024.0);
+    }
+    if bytes < 1024 * 1024 * 1024 {
+        return format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0));
+    }
+    format!("{:.1} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+}
+
+fn extract_supernote_timestamp(metadata: &HashMap<String, String>, candidates: &[&str]) -> Option<String> {
+    for key in candidates {
+        if let Some(value) = metadata.get(*key) {
+            let trimmed = value.trim();
             if !trimmed.is_empty() {
-                lines.push(trimmed.to_string());
+                return Some(trimmed.to_string());
             }
         }
     }
-    if lines.is_empty() {
+    None
+}
+
+fn normalize_text_whitespace(text: &str) -> String {
+    text
+        .split("\n\n")
+        .map(|paragraph| paragraph.lines().map(str::trim).filter(|line| !line.is_empty()).collect::<Vec<_>>().join(" "))
+        .filter(|paragraph| !paragraph.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+fn clean_duplicate_recognized_text(text: &str) -> String {
+    let sections: Vec<String> = text
+        .split("\n\n")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let mut cleaned: Vec<String> = Vec::new();
+    for section in sections {
+        let normalized_section = section.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        let looks_like_word_per_line = {
+            let lines: Vec<&str> = section.lines().collect();
+            let single_word_lines = lines.iter().filter(|line| line.split_whitespace().count() <= 1).count();
+            !lines.is_empty() && (single_word_lines as f64 / lines.len() as f64) > 0.8
+        };
+
+        let is_duplicate = cleaned.iter().any(|existing| {
+            let normalized_existing = existing.split_whitespace().collect::<Vec<_>>().join(" ");
+            normalized_existing.eq_ignore_ascii_case(&normalized_section)
+        });
+
+        if is_duplicate && looks_like_word_per_line {
+            continue;
+        }
+        cleaned.push(section);
+    }
+
+    cleaned.join("\n\n")
+}
+
+fn collect_recognized_text(notebook: &Notebook, normalize_whitespace: bool) -> String {
+    let mut page_chunks = Vec::new();
+    for (index, page) in notebook.pages.iter().enumerate() {
+        if let Some(text) = page.recognized_text.as_deref() {
+            let trimmed = text.trim();
+            if !trimmed.is_empty() {
+                let deduped = clean_duplicate_recognized_text(trimmed);
+                if deduped.trim().is_empty() {
+                    continue;
+                }
+                let final_text = if normalize_whitespace {
+                    normalize_text_whitespace(&deduped)
+                } else {
+                    deduped
+                };
+                page_chunks.push(format!("### Page {}\n\n{}", index + 1, final_text));
+            }
+        }
+    }
+    page_chunks.join("\n\n")
+}
+
+fn notebook_to_text(notebook: &Notebook, normalize_whitespace: bool) -> String {
+    let text = collect_recognized_text(notebook, normalize_whitespace);
+    if text.trim().is_empty() {
         String::new()
     } else {
-        format!("{}\n", lines.join("\n\n"))
+        format!("{}\n", text)
     }
 }
 
-fn notebook_to_markdown(input_path: &Path, notebook: &Notebook) -> String {
+fn notebook_to_markdown(input_path: &Path, output_pdf_path: &Path, notebook: &Notebook, normalize_whitespace: bool) -> String {
     let title = input_path
         .file_stem()
         .or_else(|| input_path.file_name())
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "Untitled".to_string());
 
-    let mut lines = vec![format!("# {title}")];
-    for (index, page) in notebook.pages.iter().enumerate() {
-        lines.push(format!("## Page {}", index + 1));
-        if let Some(text) = page.recognized_text.as_deref() {
-            let trimmed = text.trim();
-            if !trimmed.is_empty() {
-                lines.push(trimmed.to_string());
-                continue;
-            }
-        }
-        lines.push("_No recognized text found._".to_string());
-    }
+    let source_path = format!("/Note/{}.note", title);
+    let supernote_id = stable_supernote_id(&source_path);
+    let supernote_created = extract_supernote_timestamp(&notebook.metadata, &["CREATE_TIME", "CREATEDATE", "CREATETIME"]).unwrap_or_else(|| "unknown".to_string());
+    let supernote_modified = extract_supernote_timestamp(&notebook.metadata, &["LASTMODIFYDATE", "MODIFY_TIME", "UPDATETIME"]).unwrap_or_else(|| "unknown".to_string());
+    let file_size = std::fs::metadata(input_path).map(|m| format_file_size(m.len())).unwrap_or_else(|_| "unknown".to_string());
 
-    format!("{}\n", lines.join("\n\n"))
+    let pdf_name = output_pdf_path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| format!("{}.pdf", title));
+
+    let recognized_text = collect_recognized_text(notebook, normalize_whitespace);
+    let text_section = if recognized_text.trim().is_empty() {
+        "_No recognized text found._".to_string()
+    } else {
+        recognized_text
+    };
+
+    format!(
+        "---\nname: {title}\nsupernote_id: {supernote_id}\nsource: {source_path}\nsupernote_created: {supernote_created}\nsupernote_modified: {supernote_modified}\nsize: {file_size}\npdf_attachment: {pdf_name}\ntags:\n  - supernote\n---\n\n# {title}\n\n## Note Information\n\n| Property | Value |\n|----------|-------|\n| **Source** | `{source_path}` |\n| **Supernote Created** | {supernote_created} |\n| **Supernote Modified** | {supernote_modified} |\n| **Size** | {file_size} |\n\n## PDF Attachment\n\n![[{pdf_name}]]\n\n## Text\n\n{text_section}\n"
+    )
 }
 
 fn markdown_output_for_pdf_path(output_pdf_path: &Path) -> PathBuf {
@@ -509,12 +607,12 @@ fn markdown_output_for_pdf_path(output_pdf_path: &Path) -> PathBuf {
     markdown_path
 }
 
-fn extract_note_text(input_path: &Path, output_path: &Path) -> Result<()> {
+fn extract_note_text(input_path: &Path, output_path: &Path, normalize_whitespace: bool) -> Result<()> {
     let notebook = {
         let mut file = File::open(input_path)?;
         parse_notebook(&mut file)?
     };
-    let text = notebook_to_text(&notebook);
+    let text = notebook_to_text(&notebook, normalize_whitespace);
 
     let out_file = File::create(output_path)?;
     let mut writer = BufWriter::new(out_file);
@@ -523,12 +621,12 @@ fn extract_note_text(input_path: &Path, output_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn extract_note_markdown(input_path: &Path, output_path: &Path) -> Result<()> {
+fn extract_note_markdown(input_path: &Path, output_path: &Path, output_pdf_path: &Path, normalize_whitespace: bool) -> Result<()> {
     let notebook = {
         let mut file = File::open(input_path)?;
         parse_notebook(&mut file)?
     };
-    let markdown = notebook_to_markdown(input_path, &notebook);
+    let markdown = notebook_to_markdown(input_path, output_pdf_path, &notebook, normalize_whitespace);
 
     let out_file = File::create(output_path)?;
     let mut writer = BufWriter::new(out_file);
@@ -706,7 +804,7 @@ fn convert_note_to_pdf(input_path: &Path, output_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn process_single_file(input_file: &Path, output_file: &Path, extract_text: bool, pdf_and_markdown: bool) -> Result<()> {
+fn process_single_file(input_file: &Path, output_file: &Path, extract_text: bool, pdf_and_markdown: bool, normalize_text_whitespace: bool) -> Result<()> {
     if input_file.extension().is_none_or(|s| s != "note") {
         bail!("Input file '{}' must have a .note extension.", input_file.display());
     }
@@ -758,7 +856,7 @@ fn process_single_file(input_file: &Path, output_file: &Path, extract_text: bool
     pb.set_message(format!("{action} {}...", input_file.display()));
 
     if extract_text {
-        extract_note_text(input_file, output_file)?;
+        extract_note_text(input_file, output_file, normalize_text_whitespace)?;
     } else if pdf_and_markdown {
         convert_note_to_pdf(input_file, output_file)?;
         extract_note_markdown(
@@ -766,6 +864,8 @@ fn process_single_file(input_file: &Path, output_file: &Path, extract_text: bool
             markdown_file
                 .as_deref()
                 .expect("markdown output path should be set when --pdf-and-markdown is enabled"),
+            output_file,
+            normalize_text_whitespace,
         )?;
     } else {
         convert_note_to_pdf(input_file, output_file)?;
@@ -799,7 +899,7 @@ fn process_single_file(input_file: &Path, output_file: &Path, extract_text: bool
     Ok(())
 }
 
-fn process_directory(input_dir: &Path, output_dir: &Path, extract_text: bool, pdf_and_markdown: bool) -> Result<()> {
+fn process_directory(input_dir: &Path, output_dir: &Path, extract_text: bool, pdf_and_markdown: bool, normalize_text_whitespace: bool) -> Result<()> {
     if output_dir.is_file() {
         bail!(
             "Input is a directory, but output '{}' is a file. Please specify an output directory.",
@@ -860,11 +960,11 @@ fn process_directory(input_dir: &Path, output_dir: &Path, extract_text: bool, pd
         }
 
         let result = if extract_text {
-            extract_note_text(&input_path, &output_path)
+            extract_note_text(&input_path, &output_path, normalize_text_whitespace)
         } else if pdf_and_markdown {
             convert_note_to_pdf(&input_path, &output_path).and_then(|_| {
                 let markdown_path = markdown_output_for_pdf_path(&output_path);
-                extract_note_markdown(&input_path, &markdown_path)
+                extract_note_markdown(&input_path, &markdown_path, &output_path, normalize_text_whitespace)
             })
         } else {
             convert_note_to_pdf(&input_path, &output_path)
@@ -902,9 +1002,9 @@ fn main() -> Result<()> {
     }
 
     if cli.input.is_dir() {
-        process_directory(&cli.input, &cli.output, cli.extract_text, cli.pdf_and_markdown)?;
+        process_directory(&cli.input, &cli.output, cli.extract_text, cli.pdf_and_markdown, cli.normalize_text_whitespace)?;
     } else if cli.input.is_file() {
-        process_single_file(&cli.input, &cli.output, cli.extract_text, cli.pdf_and_markdown)?;
+        process_single_file(&cli.input, &cli.output, cli.extract_text, cli.pdf_and_markdown, cli.normalize_text_whitespace)?;
     } else {
         bail!("Input path '{}' is not a regular file or directory.", cli.input.display());
     }
@@ -914,7 +1014,8 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Notebook, Page, decode_base64, markdown_output_for_pdf_path, notebook_to_markdown, parse_recognition_payload};
+    use super::{Notebook, Page, clean_duplicate_recognized_text, decode_base64, markdown_output_for_pdf_path, normalize_text_whitespace, notebook_to_markdown, parse_recognition_payload};
+    use std::collections::HashMap;
     use std::path::Path;
 
     #[test]
@@ -956,18 +1057,37 @@ mod tests {
             ],
             width: 1404,
             height: 1872,
+            metadata: HashMap::new(),
         };
 
-        let markdown = notebook_to_markdown(Path::new("My Notes/Meeting Agenda.note"), &notebook);
-        assert_eq!(
-            markdown,
-            "# Meeting Agenda\n\n## Page 1\n\nLine one\nLine two\n\n## Page 2\n\n_No recognized text found._\n"
+        let markdown = notebook_to_markdown(
+            Path::new("My Notes/Meeting Agenda.note"),
+            Path::new("Archive/Meeting Agenda.pdf"),
+            &notebook,
+            false,
         );
+        assert!(markdown.contains("# Meeting Agenda"));
+        assert!(markdown.contains("## PDF Attachment"));
+        assert!(markdown.contains("## Text"));
     }
 
     #[test]
     fn markdown_output_for_pdf_path_replaces_extension() {
         let markdown_path = markdown_output_for_pdf_path(Path::new("output/subdir/note.pdf"));
         assert_eq!(markdown_path, Path::new("output/subdir/note.md"));
+    }
+
+    #[test]
+    fn normalize_text_whitespace_preserves_paragraphs() {
+        let input = "Line one\nline two\n\nPara two\nline b";
+        let normalized = normalize_text_whitespace(input);
+        assert_eq!(normalized, "Line one line two\n\nPara two line b");
+    }
+
+    #[test]
+    fn clean_duplicate_recognized_text_removes_word_per_line_duplicate() {
+        let input = "hello world from note\n\nhello\nworld\nfrom\nnote";
+        let cleaned = clean_duplicate_recognized_text(input);
+        assert_eq!(cleaned, "hello world from note");
     }
 }
