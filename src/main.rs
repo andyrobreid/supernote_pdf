@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, bail};
+use chrono::{DateTime, Utc};
 use clap::Parser;
 use flate2::Compression;
 use flate2::write::ZlibEncoder;
@@ -491,12 +492,27 @@ fn format_file_size(bytes: u64) -> String {
     format!("{:.1} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
 }
 
+fn format_timestamp_value(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.chars().all(|c| c.is_ascii_digit()) {
+        if let Ok(ms) = trimmed.parse::<i64>() {
+            let seconds = if trimmed.len() >= 13 { ms / 1000 } else { ms };
+            if let Some(dt) = DateTime::<Utc>::from_timestamp(seconds, 0) {
+                return dt.to_rfc3339();
+            }
+        }
+    }
+    trimmed.to_string()
+}
+
 fn extract_supernote_timestamp(metadata: &HashMap<String, String>, candidates: &[&str]) -> Option<String> {
+    let metadata_upper: HashMap<String, &String> = metadata.iter().map(|(k, v)| (k.to_ascii_uppercase(), v)).collect();
+
     for key in candidates {
-        if let Some(value) = metadata.get(*key) {
+        if let Some(value) = metadata_upper.get(&key.to_ascii_uppercase()) {
             let trimmed = value.trim();
             if !trimmed.is_empty() {
-                return Some(trimmed.to_string());
+                return Some(format_timestamp_value(trimmed));
             }
         }
     }
@@ -574,6 +590,17 @@ fn notebook_to_text(notebook: &Notebook, normalize_whitespace: bool) -> String {
     }
 }
 
+fn filesystem_timestamp_string(input_path: &Path, kind: &str) -> Option<String> {
+    let metadata = std::fs::metadata(input_path).ok()?;
+    let ts = match kind {
+        "created" => metadata.created().ok()?,
+        "modified" => metadata.modified().ok()?,
+        _ => return None,
+    };
+    let dt: DateTime<Utc> = ts.into();
+    Some(dt.to_rfc3339())
+}
+
 fn notebook_to_markdown(input_path: &Path, output_pdf_path: &Path, notebook: &Notebook, normalize_whitespace: bool) -> String {
     let title = input_path
         .file_stem()
@@ -583,8 +610,18 @@ fn notebook_to_markdown(input_path: &Path, output_pdf_path: &Path, notebook: &No
 
     let source_path = format!("/Note/{}.note", title);
     let supernote_id = stable_supernote_id(&source_path);
-    let supernote_created = extract_supernote_timestamp(&notebook.metadata, &["CREATE_TIME", "CREATEDATE", "CREATETIME"]).unwrap_or_else(|| "unknown".to_string());
-    let supernote_modified = extract_supernote_timestamp(&notebook.metadata, &["LASTMODIFYDATE", "MODIFY_TIME", "UPDATETIME"]).unwrap_or_else(|| "unknown".to_string());
+    let supernote_created = extract_supernote_timestamp(
+        &notebook.metadata,
+        &["CREATE_TIME", "CREATEDATE", "CREATETIME", "FILE_CREATE_TIME", "FILE_CREATEDATE", "FILE_CREATETIME"],
+    )
+    .unwrap_or_else(|| "unknown".to_string());
+    let supernote_modified = extract_supernote_timestamp(
+        &notebook.metadata,
+        &["LASTMODIFYDATE", "MODIFY_TIME", "UPDATETIME", "FILE_LASTMODIFYDATE", "FILE_MODIFY_TIME", "FILE_UPDATETIME"],
+    )
+    .unwrap_or_else(|| "unknown".to_string());
+    let file_created = filesystem_timestamp_string(input_path, "created").unwrap_or_else(|| "unknown".to_string());
+    let file_modified = filesystem_timestamp_string(input_path, "modified").unwrap_or_else(|| "unknown".to_string());
     let file_size = std::fs::metadata(input_path).map(|m| format_file_size(m.len())).unwrap_or_else(|_| "unknown".to_string());
 
     let pdf_name = output_pdf_path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| format!("{}.pdf", title));
@@ -597,7 +634,7 @@ fn notebook_to_markdown(input_path: &Path, output_pdf_path: &Path, notebook: &No
     };
 
     format!(
-        "---\nname: {title}\nsupernote_id: {supernote_id}\nsource: {source_path}\nsupernote_created: {supernote_created}\nsupernote_modified: {supernote_modified}\nsize: {file_size}\npdf_attachment: {pdf_name}\ntags:\n  - supernote\n---\n\n# {title}\n\n## Note Information\n\n| Property | Value |\n|----------|-------|\n| **Source** | `{source_path}` |\n| **Supernote Created** | {supernote_created} |\n| **Supernote Modified** | {supernote_modified} |\n| **Size** | {file_size} |\n\n## PDF Attachment\n\n![[{pdf_name}]]\n\n## Text\n\n{text_section}\n"
+        "---\nname: {title}\nsupernote_id: {supernote_id}\nsource: {source_path}\nsupernote_created: {supernote_created}\nsupernote_modified: {supernote_modified}\nfile_created: {file_created}\nfile_modified: {file_modified}\nsize: {file_size}\npdf_attachment: {pdf_name}\ntags:\n  - supernote\n---\n\n# {title}\n\n## Note Information\n\n| Property | Value |\n|----------|-------|\n| **Source** | `{source_path}` |\n| **Supernote Created** | {supernote_created} |\n| **Supernote Modified** | {supernote_modified} |\n| **File Created** | {file_created} |\n| **File Modified** | {file_modified} |\n| **Size** | {file_size} |\n\n## PDF Attachment\n\n![[{pdf_name}]]\n\n## Text\n\n{text_section}\n"
     )
 }
 
