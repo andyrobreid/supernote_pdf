@@ -88,7 +88,7 @@ To generate Markdown only (no PDF), add `--markdown-only` and set the output ext
 
 If you want cleaner paragraph text in markdown, add `--normalize-text-whitespace` (requires `--pdf-and-markdown` or `--markdown-only`). This converts single newlines to spaces while preserving paragraph breaks (double newlines).
 
-For better readability in Obsidian, add `--smart-markdown-breaks` (requires markdown mode). This inserts markdown paragraph breaks at likely sentence boundaries and around structural gaps (for example bullet-like OCR markers).
+Smart markdown breaks are now enabled by default in markdown modes (`--pdf-and-markdown` and `--markdown-only`) for better readability in Obsidian. The `--smart-markdown-breaks` flag is kept for compatibility.
 
 ### Example 1: Convert a Single File
 

@@ -1342,13 +1342,15 @@ fn main() -> Result<()> {
     if cli.normalize_text_whitespace && !(cli.pdf_and_markdown || cli.markdown_only || cli.extract_text) {
         bail!("--normalize-text-whitespace requires --pdf-and-markdown, --markdown-only, or --extract-text");
     }
-    if cli.smart_markdown_breaks && !(cli.pdf_and_markdown || cli.markdown_only) {
-        bail!("--smart-markdown-breaks requires --pdf-and-markdown or --markdown-only");
-    }
-
     if !cli.input.exists() {
         bail!("Input path '{}' does not exist.", cli.input.display());
     }
+
+    let effective_smart_markdown_breaks = if cli.pdf_and_markdown || cli.markdown_only {
+        true
+    } else {
+        cli.smart_markdown_breaks
+    };
 
     if cli.input.is_dir() {
         process_directory(
@@ -1358,7 +1360,7 @@ fn main() -> Result<()> {
             cli.pdf_and_markdown,
             cli.markdown_only,
             cli.normalize_text_whitespace,
-            cli.smart_markdown_breaks,
+            effective_smart_markdown_breaks,
         )?;
     } else if cli.input.is_file() {
         process_single_file(
@@ -1368,7 +1370,7 @@ fn main() -> Result<()> {
             cli.pdf_and_markdown,
             cli.markdown_only,
             cli.normalize_text_whitespace,
-            cli.smart_markdown_breaks,
+            effective_smart_markdown_breaks,
         )?;
     } else {
         bail!("Input path '{}' is not a regular file or directory.", cli.input.display());
