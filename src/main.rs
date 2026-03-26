@@ -32,12 +32,16 @@ struct Cli {
     extract_text: bool,
 
     /// Generate both .pdf and .md outputs for each .note (cannot be used with --extract-text)
-    #[arg(long, default_value_t = false, conflicts_with = "extract_text")]
+    #[arg(long, default_value_t = false, conflicts_with_all = ["extract_text", "markdown_only"])]
     pdf_and_markdown: bool,
+
+    /// Generate markdown-only output (.md) from recognized text without generating PDFs
+    #[arg(long, default_value_t = false, conflicts_with_all = ["extract_text", "pdf_and_markdown"])]
+    markdown_only: bool,
 
     /// Normalize recognized text whitespace in markdown output: single newlines become spaces,
     /// paragraph breaks (double newlines) are preserved
-    #[arg(long, default_value_t = false, requires = "pdf_and_markdown")]
+    #[arg(long, default_value_t = false)]
     normalize_text_whitespace: bool,
 }
 const A5X_WIDTH: usize = 1404;
@@ -520,20 +524,22 @@ fn extract_supernote_timestamp(metadata: &HashMap<String, String>, candidates: &
 }
 
 fn normalize_text_whitespace(text: &str) -> String {
-    text
-        .split("\n\n")
-        .map(|paragraph| paragraph.lines().map(str::trim).filter(|line| !line.is_empty()).collect::<Vec<_>>().join(" "))
+    text.split("\n\n")
+        .map(|paragraph| {
+            paragraph
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
         .filter(|paragraph| !paragraph.trim().is_empty())
         .collect::<Vec<_>>()
         .join("\n\n")
 }
 
 fn clean_duplicate_recognized_text(text: &str) -> String {
-    let sections: Vec<String> = text
-        .split("\n\n")
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
+    let sections: Vec<String> = text.split("\n\n").map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
 
     let mut cleaned: Vec<String> = Vec::new();
     for section in sections {
@@ -583,11 +589,7 @@ fn collect_recognized_text(notebook: &Notebook, normalize_whitespace: bool) -> S
 
 fn notebook_to_text(notebook: &Notebook, normalize_whitespace: bool) -> String {
     let text = collect_recognized_text(notebook, normalize_whitespace);
-    if text.trim().is_empty() {
-        String::new()
-    } else {
-        format!("{}\n", text)
-    }
+    if text.trim().is_empty() { String::new() } else { format!("{}\n", text) }
 }
 
 fn filesystem_timestamp_string(input_path: &Path, kind: &str) -> Option<String> {
@@ -601,7 +603,7 @@ fn filesystem_timestamp_string(input_path: &Path, kind: &str) -> Option<String> 
     Some(dt.to_rfc3339())
 }
 
-fn notebook_to_markdown(input_path: &Path, output_pdf_path: &Path, notebook: &Notebook, normalize_whitespace: bool) -> String {
+fn notebook_to_markdown(input_path: &Path, output_pdf_path: Option<&Path>, notebook: &Notebook, normalize_whitespace: bool) -> String {
     let title = input_path
         .file_stem()
         .or_else(|| input_path.file_name())
@@ -612,19 +614,35 @@ fn notebook_to_markdown(input_path: &Path, output_pdf_path: &Path, notebook: &No
     let supernote_id = stable_supernote_id(&source_path);
     let supernote_created = extract_supernote_timestamp(
         &notebook.metadata,
-        &["CREATE_TIME", "CREATEDATE", "CREATETIME", "FILE_CREATE_TIME", "FILE_CREATEDATE", "FILE_CREATETIME"],
+        &[
+            "CREATE_TIME",
+            "CREATEDATE",
+            "CREATETIME",
+            "FILE_CREATE_TIME",
+            "FILE_CREATEDATE",
+            "FILE_CREATETIME",
+        ],
     )
     .unwrap_or_else(|| "unknown".to_string());
     let supernote_modified = extract_supernote_timestamp(
         &notebook.metadata,
-        &["LASTMODIFYDATE", "MODIFY_TIME", "UPDATETIME", "FILE_LASTMODIFYDATE", "FILE_MODIFY_TIME", "FILE_UPDATETIME"],
+        &[
+            "LASTMODIFYDATE",
+            "MODIFY_TIME",
+            "UPDATETIME",
+            "FILE_LASTMODIFYDATE",
+            "FILE_MODIFY_TIME",
+            "FILE_UPDATETIME",
+        ],
     )
     .unwrap_or_else(|| "unknown".to_string());
     let file_created = filesystem_timestamp_string(input_path, "created").unwrap_or_else(|| "unknown".to_string());
     let file_modified = filesystem_timestamp_string(input_path, "modified").unwrap_or_else(|| "unknown".to_string());
-    let file_size = std::fs::metadata(input_path).map(|m| format_file_size(m.len())).unwrap_or_else(|_| "unknown".to_string());
+    let file_size = std::fs::metadata(input_path)
+        .map(|m| format_file_size(m.len()))
+        .unwrap_or_else(|_| "unknown".to_string());
 
-    let pdf_name = output_pdf_path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| format!("{}.pdf", title));
+    let pdf_name = output_pdf_path.and_then(|path| path.file_name().map(|s| s.to_string_lossy().into_owned()));
 
     let recognized_text = collect_recognized_text(notebook, normalize_whitespace);
     let text_section = if recognized_text.trim().is_empty() {
@@ -633,8 +651,15 @@ fn notebook_to_markdown(input_path: &Path, output_pdf_path: &Path, notebook: &No
         recognized_text
     };
 
+    let pdf_frontmatter = pdf_name.as_ref().map(|name| format!("pdf_attachment: {name}\n")).unwrap_or_default();
+
+    let pdf_section = pdf_name
+        .as_ref()
+        .map(|name| format!("\n## PDF Attachment\n\n![[{name}]]\n"))
+        .unwrap_or_default();
+
     format!(
-        "---\nname: {title}\nsupernote_id: {supernote_id}\nsource: {source_path}\nsupernote_created: {supernote_created}\nsupernote_modified: {supernote_modified}\nfile_created: {file_created}\nfile_modified: {file_modified}\nsize: {file_size}\npdf_attachment: {pdf_name}\ntags:\n  - supernote\n---\n\n# {title}\n\n## Note Information\n\n| Property | Value |\n|----------|-------|\n| **Source** | `{source_path}` |\n| **Supernote Created** | {supernote_created} |\n| **Supernote Modified** | {supernote_modified} |\n| **File Created** | {file_created} |\n| **File Modified** | {file_modified} |\n| **Size** | {file_size} |\n\n## PDF Attachment\n\n![[{pdf_name}]]\n\n## Text\n\n{text_section}\n"
+        "---\nname: {title}\nsupernote_id: {supernote_id}\nsource: {source_path}\nsupernote_created: {supernote_created}\nsupernote_modified: {supernote_modified}\nfile_created: {file_created}\nfile_modified: {file_modified}\nsize: {file_size}\n{pdf_frontmatter}tags:\n  - supernote\n---\n\n# {title}\n\n## Note Information\n\n| Property | Value |\n|----------|-------|\n| **Source** | `{source_path}` |\n| **Supernote Created** | {supernote_created} |\n| **Supernote Modified** | {supernote_modified} |\n| **File Created** | {file_created} |\n| **File Modified** | {file_modified} |\n| **Size** | {file_size} |\n{pdf_section}\n## Text\n\n{text_section}\n"
     )
 }
 
@@ -658,7 +683,7 @@ fn extract_note_text(input_path: &Path, output_path: &Path, normalize_whitespace
     Ok(())
 }
 
-fn extract_note_markdown(input_path: &Path, output_path: &Path, output_pdf_path: &Path, normalize_whitespace: bool) -> Result<()> {
+fn extract_note_markdown(input_path: &Path, output_path: &Path, output_pdf_path: Option<&Path>, normalize_whitespace: bool) -> Result<()> {
     let notebook = {
         let mut file = File::open(input_path)?;
         parse_notebook(&mut file)?
@@ -841,7 +866,14 @@ fn convert_note_to_pdf(input_path: &Path, output_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn process_single_file(input_file: &Path, output_file: &Path, extract_text: bool, pdf_and_markdown: bool, normalize_text_whitespace: bool) -> Result<()> {
+fn process_single_file(
+    input_file: &Path,
+    output_file: &Path,
+    extract_text: bool,
+    pdf_and_markdown: bool,
+    markdown_only: bool,
+    normalize_text_whitespace: bool,
+) -> Result<()> {
     if input_file.extension().is_none_or(|s| s != "note") {
         bail!("Input file '{}' must have a .note extension.", input_file.display());
     }
@@ -851,7 +883,13 @@ fn process_single_file(input_file: &Path, output_file: &Path, extract_text: bool
             output_file.display()
         );
     }
-    let expected_output_ext = if extract_text { "txt" } else { "pdf" };
+    let expected_output_ext = if extract_text {
+        "txt"
+    } else if markdown_only {
+        "md"
+    } else {
+        "pdf"
+    };
     if output_file.extension().is_none_or(|s| s != expected_output_ext) {
         bail!("Output file '{}' must have a .{} extension.", output_file.display(), expected_output_ext);
     }
@@ -878,6 +916,8 @@ fn process_single_file(input_file: &Path, output_file: &Path, extract_text: bool
         println!("Extracting recognized text from single file...");
     } else if pdf_and_markdown {
         println!("Converting single file and generating markdown...");
+    } else if markdown_only {
+        println!("Generating markdown from single file...");
     } else {
         println!("Converting single file...");
     }
@@ -887,6 +927,8 @@ fn process_single_file(input_file: &Path, output_file: &Path, extract_text: bool
         "Extracting text from"
     } else if pdf_and_markdown {
         "Converting and extracting text from"
+    } else if markdown_only {
+        "Extracting markdown from"
     } else {
         "Converting"
     };
@@ -901,9 +943,11 @@ fn process_single_file(input_file: &Path, output_file: &Path, extract_text: bool
             markdown_file
                 .as_deref()
                 .expect("markdown output path should be set when --pdf-and-markdown is enabled"),
-            output_file,
+            Some(output_file),
             normalize_text_whitespace,
         )?;
+    } else if markdown_only {
+        extract_note_markdown(input_file, output_file, None, normalize_text_whitespace)?;
     } else {
         convert_note_to_pdf(input_file, output_file)?;
     }
@@ -912,6 +956,8 @@ fn process_single_file(input_file: &Path, output_file: &Path, extract_text: bool
         "Text extraction complete!"
     } else if pdf_and_markdown {
         "PDF and markdown generation complete!"
+    } else if markdown_only {
+        "Markdown generation complete!"
     } else {
         "Conversion complete!"
     };
@@ -936,7 +982,14 @@ fn process_single_file(input_file: &Path, output_file: &Path, extract_text: bool
     Ok(())
 }
 
-fn process_directory(input_dir: &Path, output_dir: &Path, extract_text: bool, pdf_and_markdown: bool, normalize_text_whitespace: bool) -> Result<()> {
+fn process_directory(
+    input_dir: &Path,
+    output_dir: &Path,
+    extract_text: bool,
+    pdf_and_markdown: bool,
+    markdown_only: bool,
+    normalize_text_whitespace: bool,
+) -> Result<()> {
     if output_dir.is_file() {
         bail!(
             "Input is a directory, but output '{}' is a file. Please specify an output directory.",
@@ -961,7 +1014,13 @@ fn process_directory(input_dir: &Path, output_dir: &Path, extract_text: bool, pd
             // Create the corresponding output path by mirroring the directory structure
             let relative_path = input_path.strip_prefix(input_dir).expect("Path from WalkDir should have a known prefix");
             let mut output_path = output_dir.join(relative_path);
-            output_path.set_extension(if extract_text { "txt" } else { "pdf" });
+            output_path.set_extension(if extract_text {
+                "txt"
+            } else if markdown_only {
+                "md"
+            } else {
+                "pdf"
+            });
             (input_path, output_path)
         })
         .collect();
@@ -976,6 +1035,8 @@ fn process_directory(input_dir: &Path, output_dir: &Path, extract_text: bool, pd
         println!("Found {} files to extract text from. Starting extraction...", num_jobs);
     } else if pdf_and_markdown {
         println!("Found {} files to convert and generate markdown for. Starting processing...", num_jobs);
+    } else if markdown_only {
+        println!("Found {} files to generate markdown for. Starting processing...", num_jobs);
     } else {
         println!("Found {} files to convert. Starting conversion...", num_jobs);
     }
@@ -988,6 +1049,8 @@ fn process_directory(input_dir: &Path, output_dir: &Path, extract_text: bool, pd
             "Extracting text from"
         } else if pdf_and_markdown {
             "Converting and extracting text from"
+        } else if markdown_only {
+            "Extracting markdown from"
         } else {
             "Converting"
         };
@@ -1001,8 +1064,10 @@ fn process_directory(input_dir: &Path, output_dir: &Path, extract_text: bool, pd
         } else if pdf_and_markdown {
             convert_note_to_pdf(&input_path, &output_path).and_then(|_| {
                 let markdown_path = markdown_output_for_pdf_path(&output_path);
-                extract_note_markdown(&input_path, &markdown_path, &output_path, normalize_text_whitespace)
+                extract_note_markdown(&input_path, &markdown_path, Some(&output_path), normalize_text_whitespace)
             })
+        } else if markdown_only {
+            extract_note_markdown(&input_path, &output_path, None, normalize_text_whitespace)
         } else {
             convert_note_to_pdf(&input_path, &output_path)
         };
@@ -1016,6 +1081,8 @@ fn process_directory(input_dir: &Path, output_dir: &Path, extract_text: bool, pd
         "All text files extracted!"
     } else if pdf_and_markdown {
         "All PDF and markdown files generated!"
+    } else if markdown_only {
+        "All markdown files generated!"
     } else {
         "All files converted!"
     };
@@ -1024,6 +1091,8 @@ fn process_directory(input_dir: &Path, output_dir: &Path, extract_text: bool, pd
         println!("Extracted text from {} files in {:?}", num_jobs, start.elapsed());
     } else if pdf_and_markdown {
         println!("Converted and generated markdown for {} files in {:?}", num_jobs, start.elapsed());
+    } else if markdown_only {
+        println!("Generated markdown for {} files in {:?}", num_jobs, start.elapsed());
     } else {
         println!("Converted {} files in {:?}", num_jobs, start.elapsed());
     }
@@ -1034,14 +1103,32 @@ fn process_directory(input_dir: &Path, output_dir: &Path, extract_text: bool, pd
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    if cli.normalize_text_whitespace && !(cli.pdf_and_markdown || cli.markdown_only || cli.extract_text) {
+        bail!("--normalize-text-whitespace requires --pdf-and-markdown, --markdown-only, or --extract-text");
+    }
+
     if !cli.input.exists() {
         bail!("Input path '{}' does not exist.", cli.input.display());
     }
 
     if cli.input.is_dir() {
-        process_directory(&cli.input, &cli.output, cli.extract_text, cli.pdf_and_markdown, cli.normalize_text_whitespace)?;
+        process_directory(
+            &cli.input,
+            &cli.output,
+            cli.extract_text,
+            cli.pdf_and_markdown,
+            cli.markdown_only,
+            cli.normalize_text_whitespace,
+        )?;
     } else if cli.input.is_file() {
-        process_single_file(&cli.input, &cli.output, cli.extract_text, cli.pdf_and_markdown, cli.normalize_text_whitespace)?;
+        process_single_file(
+            &cli.input,
+            &cli.output,
+            cli.extract_text,
+            cli.pdf_and_markdown,
+            cli.markdown_only,
+            cli.normalize_text_whitespace,
+        )?;
     } else {
         bail!("Input path '{}' is not a regular file or directory.", cli.input.display());
     }
@@ -1051,7 +1138,10 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Notebook, Page, clean_duplicate_recognized_text, decode_base64, markdown_output_for_pdf_path, normalize_text_whitespace, notebook_to_markdown, parse_recognition_payload};
+    use super::{
+        Notebook, Page, clean_duplicate_recognized_text, decode_base64, markdown_output_for_pdf_path, normalize_text_whitespace,
+        notebook_to_markdown, parse_recognition_payload,
+    };
     use std::collections::HashMap;
     use std::path::Path;
 
@@ -1099,7 +1189,7 @@ mod tests {
 
         let markdown = notebook_to_markdown(
             Path::new("My Notes/Meeting Agenda.note"),
-            Path::new("Archive/Meeting Agenda.pdf"),
+            Some(Path::new("Archive/Meeting Agenda.pdf")),
             &notebook,
             false,
         );
@@ -1112,6 +1202,26 @@ mod tests {
     fn markdown_output_for_pdf_path_replaces_extension() {
         let markdown_path = markdown_output_for_pdf_path(Path::new("output/subdir/note.pdf"));
         assert_eq!(markdown_path, Path::new("output/subdir/note.md"));
+    }
+
+    #[test]
+    fn notebook_to_markdown_omits_pdf_section_when_no_pdf_output() {
+        let notebook = Notebook {
+            signature: "SN_FILE_VER_20230015".to_string(),
+            pages: vec![Page {
+                addr: 1,
+                layers: vec![],
+                recognized_text: Some("Line one".to_string()),
+            }],
+            width: 1404,
+            height: 1872,
+            metadata: HashMap::new(),
+        };
+
+        let markdown = notebook_to_markdown(Path::new("My Notes/Meeting Agenda.note"), None, &notebook, false);
+        assert!(!markdown.contains("## PDF Attachment"));
+        assert!(!markdown.contains("pdf_attachment:"));
+        assert!(markdown.contains("## Text"));
     }
 
     #[test]

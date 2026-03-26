@@ -22,6 +22,7 @@ This tool is designed for one thing: converting Supernote `.note` files to PDF a
 - **💻 Simple & Powerful CLI:** A straightforward command-line interface for single-file or batch conversions.
 - **📝 Text Extraction:** Optional OCR-text extraction mode for notes with Supernote recognition data (`RECOGNTEXT`), outputting `.txt`.
 - **📄+📝 PDF and Markdown Mode:** Optional mode to generate both `.pdf` and `.md` per note in one run.
+- **📝 Markdown-only Mode:** Optional mode to generate `.md` only (no PDF output).
 - **🔧 Optimized for Archival:** Creates PDFs with embedded images, keeping file sizes small and conversion times low for densely written notes.
 - **✅ Robust:** Includes safety checks to prevent accidental data loss (e.g., won't overwrite an existing output directory).
 
@@ -83,7 +84,9 @@ To extract recognized text instead of generating a PDF, add `--extract-text` and
 
 To generate both a PDF and a Markdown file per note, add `--pdf-and-markdown`. This mode writes PDFs as normal and writes Obsidian-friendly Markdown with Supernote metadata, PDF wikilink attachment, and recognized text (`RECOGNTEXT`) in a `## Text` section.
 
-If you want cleaner paragraph text in markdown, add `--normalize-text-whitespace` (requires `--pdf-and-markdown`). This converts single newlines to spaces while preserving paragraph breaks (double newlines).
+To generate Markdown only (no PDF), add `--markdown-only` and set the output extension to `.md` (or an output directory for batch mode).
+
+If you want cleaner paragraph text in markdown, add `--normalize-text-whitespace` (requires `--pdf-and-markdown` or `--markdown-only`). This converts single newlines to spaces while preserving paragraph breaks (double newlines).
 
 ### Example 1: Convert a Single File
 
@@ -141,6 +144,12 @@ This mirrors the source directory structure and writes `.pdf` and `.md` sibling 
 
 ```bash
 supernote_pdf -i "My Notes/Meeting Agenda.note" -o "Archive/Meeting Agenda.pdf" --pdf-and-markdown --normalize-text-whitespace
+```
+
+### Example 8: Generate Markdown only (no PDF)
+
+```bash
+supernote_pdf -i "My Notes/Meeting Agenda.note" -o "Archive/Meeting Agenda.md" --markdown-only
 ```
 
 ## 📊 Benchmarks
