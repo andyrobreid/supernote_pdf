@@ -230,6 +230,43 @@ fn unescape_json_string(input: &str) -> Option<String> {
     Some(out)
 }
 
+fn normalize_ocr_label_for_dedup(label: &str) -> String {
+    label
+        .to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .replace(" .", ".")
+        .replace(" ,", ",")
+        .replace(" :", ":")
+        .replace(" ;", ";")
+        .replace(" !", "!")
+        .replace(" ?", "?")
+        .replace(" ]", "]")
+        .replace("[ ", "[")
+        .replace(" )", ")")
+        .replace("( ", "(")
+}
+
+fn dedupe_ocr_labels(labels: Vec<String>) -> Vec<String> {
+    let mut deduped: Vec<String> = Vec::new();
+    let mut seen_norm: Vec<String> = Vec::new();
+
+    for label in labels {
+        let norm = normalize_ocr_label_for_dedup(&label);
+        if norm.is_empty() {
+            continue;
+        }
+        if seen_norm.iter().any(|s| s == &norm) {
+            continue;
+        }
+        seen_norm.push(norm);
+        deduped.push(label);
+    }
+
+    deduped
+}
+
 fn parse_recognition_payload(payload: &str) -> Result<Option<String>> {
     let trimmed = payload.trim();
     if trimmed.is_empty() {
@@ -257,6 +294,8 @@ fn parse_recognition_payload(payload: &str) -> Result<Option<String>> {
             .filter(|label| !label.is_empty())
             .collect();
     }
+
+    labels = dedupe_ocr_labels(labels);
 
     if labels.is_empty() { Ok(None) } else { Ok(Some(labels.join("\n"))) }
 }
@@ -1158,6 +1197,14 @@ mod tests {
         let parsed = parse_recognition_payload(payload).expect("payload should parse");
         assert_eq!(parsed.as_deref(), Some("x"));
         assert_eq!(parse_recognition_payload("   ").expect("blank should parse"), None);
+    }
+
+    #[test]
+    fn parse_recognition_payload_dedupes_punctuation_spaced_variants() {
+        let payload =
+            "eyJlbGVtZW50cyI6W3sidHlwZSI6IlRleHQiLCJsYWJlbCI6IkhlbGxvLCB3b3JsZC4ifSx7InR5cGUiOiJUZXh0IiwibGFiZWwiOiJIZWxsbyAsIHdvcmxkIC4ifV19";
+        let parsed = parse_recognition_payload(payload).expect("payload should parse");
+        assert_eq!(parsed.as_deref(), Some("Hello, world."));
     }
 
     #[test]
