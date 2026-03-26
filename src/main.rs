@@ -248,6 +248,69 @@ fn normalize_ocr_label_for_dedup(label: &str) -> String {
         .replace("( ", "(")
 }
 
+fn ocr_tokens(label: &str) -> Vec<String> {
+    label
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c.to_ascii_lowercase() } else { ' ' })
+        .collect::<String>()
+        .split_whitespace()
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn dice_similarity(tokens_a: &[String], tokens_b: &[String]) -> f64 {
+    if tokens_a.is_empty() || tokens_b.is_empty() {
+        return 0.0;
+    }
+
+    let mut freq_a: HashMap<&str, usize> = HashMap::new();
+    for t in tokens_a {
+        *freq_a.entry(t.as_str()).or_insert(0) += 1;
+    }
+
+    let mut intersection = 0usize;
+    for t in tokens_b {
+        if let Some(count) = freq_a.get_mut(t.as_str())
+            && *count > 0
+        {
+            *count -= 1;
+            intersection += 1;
+        }
+    }
+
+    (2.0 * intersection as f64) / (tokens_a.len() + tokens_b.len()) as f64
+}
+
+fn is_near_duplicate_label(existing: &str, candidate: &str) -> bool {
+    let existing_tokens = ocr_tokens(existing);
+    let candidate_tokens = ocr_tokens(candidate);
+
+    if existing_tokens.is_empty() || candidate_tokens.is_empty() {
+        return false;
+    }
+
+    // quick exact tokenized match
+    if existing_tokens == candidate_tokens {
+        return true;
+    }
+
+    // Require leading phrase agreement to avoid deleting genuinely different notes
+    let prefix = existing_tokens
+        .iter()
+        .zip(candidate_tokens.iter())
+        .take(6)
+        .filter(|(a, b)| a == b)
+        .count();
+    if prefix < 4 {
+        return false;
+    }
+
+    let sim = dice_similarity(&existing_tokens, &candidate_tokens);
+    let len_ratio = (existing_tokens.len().min(candidate_tokens.len()) as f64) / (existing_tokens.len().max(candidate_tokens.len()) as f64);
+
+    sim >= 0.78 && len_ratio >= 0.6
+}
+
 fn dedupe_ocr_labels(labels: Vec<String>) -> Vec<String> {
     let mut deduped: Vec<String> = Vec::new();
     let mut seen_norm: Vec<String> = Vec::new();
@@ -260,6 +323,11 @@ fn dedupe_ocr_labels(labels: Vec<String>) -> Vec<String> {
         if seen_norm.iter().any(|s| s == &norm) {
             continue;
         }
+
+        if deduped.iter().any(|existing| is_near_duplicate_label(existing, &label)) {
+            continue;
+        }
+
         seen_norm.push(norm);
         deduped.push(label);
     }
@@ -604,6 +672,57 @@ fn clean_duplicate_recognized_text(text: &str) -> String {
     cleaned.join("\n\n")
 }
 
+fn trim_inline_near_duplicate_passage(text: &str) -> String {
+    let mut spans: Vec<(usize, String)> = Vec::new();
+    let mut current = String::new();
+    let mut start_idx: Option<usize> = None;
+
+    for (idx, ch) in text.char_indices() {
+        if ch.is_alphanumeric() {
+            if start_idx.is_none() {
+                start_idx = Some(idx);
+            }
+            current.push(ch.to_ascii_lowercase());
+        } else if !current.is_empty() {
+            spans.push((start_idx.unwrap_or(0), current.clone()));
+            current.clear();
+            start_idx = None;
+        }
+    }
+    if !current.is_empty() {
+        spans.push((start_idx.unwrap_or(0), current));
+    }
+
+    if spans.len() < 40 {
+        return text.to_string();
+    }
+
+    let head: Vec<String> = spans.iter().take(4).map(|(_, t)| t.clone()).collect();
+    if head.len() < 4 {
+        return text.to_string();
+    }
+
+    for i in 20..(spans.len().saturating_sub(20)) {
+        let cand: Vec<String> = spans.iter().skip(i).take(4).map(|(_, t)| t.clone()).collect();
+        if cand != head {
+            continue;
+        }
+
+        let prefix_tokens: Vec<String> = spans.iter().take(i).map(|(_, t)| t.clone()).collect();
+        let suffix_tokens: Vec<String> = spans.iter().skip(i).map(|(_, t)| t.clone()).collect();
+
+        let sim = dice_similarity(&prefix_tokens, &suffix_tokens);
+        let len_ratio = (prefix_tokens.len().min(suffix_tokens.len()) as f64) / (prefix_tokens.len().max(suffix_tokens.len()) as f64);
+
+        if sim >= 0.72 && len_ratio >= 0.45 {
+            let cut_byte = spans[i].0;
+            return text[..cut_byte].trim_end().to_string();
+        }
+    }
+
+    text.to_string()
+}
+
 fn collect_recognized_text(notebook: &Notebook, normalize_whitespace: bool) -> String {
     let mut page_chunks = Vec::new();
     for (index, page) in notebook.pages.iter().enumerate() {
@@ -614,10 +733,11 @@ fn collect_recognized_text(notebook: &Notebook, normalize_whitespace: bool) -> S
                 if deduped.trim().is_empty() {
                     continue;
                 }
+                let deduped_inline = trim_inline_near_duplicate_passage(&deduped);
                 let final_text = if normalize_whitespace {
-                    normalize_text_whitespace(&deduped)
+                    normalize_text_whitespace(&deduped_inline)
                 } else {
-                    deduped
+                    deduped_inline
                 };
                 page_chunks.push(format!("### Page {}\n\n{}", index + 1, final_text));
             }
@@ -1208,6 +1328,16 @@ mod tests {
     }
 
     #[test]
+    fn parse_recognition_payload_dedupes_near_duplicate_labels() {
+        let payload = "eyJlbGVtZW50cyI6W3sidHlwZSI6IlRleHQiLCJsYWJlbCI6IlByYXllciBsaXN0LiBNYXR0aGV3IDIxOjIyIEFuZCBhbGwgdGhpbmdzLCB3aGF0c29ldmVyIHllIHNoYWxsIGFzayBpbiBwcmF5ZXIsIGJlbGlldmluZywgeWUgc2hhbGwgcmVjZWl2ZS4ifSx7InR5cGUiOiJUZXh0IiwibGFiZWwiOiJQcmF5ZXIgbGlzdCAuIE1hdHRoZXcgMjE6MjIgQW5kIGFsbCB0aGluZ3MgLCB3aGF0c29ldmVyIHllIHNoYWxsIGFzayBpbiBiZWxpZXZpbmcgcmVjZWl2ZSJ9XX0=";
+        let parsed = parse_recognition_payload(payload).expect("payload should parse");
+        assert_eq!(
+            parsed.as_deref(),
+            Some("Prayer list. Matthew 21:22 And all things, whatsoever ye shall ask in prayer, believing, ye shall receive.")
+        );
+    }
+
+    #[test]
     fn decode_base64_supports_urlsafe_without_padding() {
         let decoded = decode_base64("SGVsbG8td29ybGQ").expect("urlsafe should decode");
         assert_eq!(decoded, b"Hello-world");
@@ -1283,5 +1413,15 @@ mod tests {
         let input = "hello world from note\n\nhello\nworld\nfrom\nnote";
         let cleaned = clean_duplicate_recognized_text(input);
         assert_eq!(cleaned, "hello world from note");
+    }
+
+    #[test]
+    fn trim_inline_near_duplicate_passage_removes_repeated_tail() {
+        let base = "Prayer list Matthew 21 22 and all things whatsoever ye shall ask in prayer believing ye shall receive sunday singing and church notes and family names";
+        let duplicate =
+            "Prayer list Matthew 21 22 and all things whatsoever ye shall ask in believing receive sunday singing and church notes and family names";
+        let input = format!("{} {}", base, duplicate);
+        let trimmed = super::trim_inline_near_duplicate_passage(&input);
+        assert_eq!(trimmed, base);
     }
 }
