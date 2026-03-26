@@ -39,10 +39,16 @@ struct Cli {
     #[arg(long, default_value_t = false, conflicts_with_all = ["extract_text", "pdf_and_markdown"])]
     markdown_only: bool,
 
-    /// Normalize recognized text whitespace in markdown output: single newlines become spaces,
+    /// Normalize recognized text whitespace in markdown/text output: single newlines become spaces,
     /// paragraph breaks (double newlines) are preserved
     #[arg(long, default_value_t = false)]
     normalize_text_whitespace: bool,
+
+    /// Smarter markdown text formatting: keep paragraph breaks and introduce blank lines
+    /// at likely sentence boundaries / structural gaps for better readability in Obsidian.
+    /// Requires markdown output mode.
+    #[arg(long, default_value_t = false)]
+    smart_markdown_breaks: bool,
 }
 const A5X_WIDTH: usize = 1404;
 const A5X_HEIGHT: usize = 1872;
@@ -56,6 +62,7 @@ lazy_static! {
     static ref METADATA_RE: Regex = Regex::new(r"<(?P<key>[^:]+?):(?P<value>.*?)>").unwrap();
     static ref TEXT_OBJECT_RE: Regex = Regex::new(r#"\{[^{}]*"type"\s*:\s*"Text"[^{}]*\}"#).unwrap();
     static ref LABEL_RE: Regex = Regex::new(r#""label"\s*:\s*"((?:\\.|[^"\\])*)""#).unwrap();
+    static ref SENTENCE_BREAK_RE: Regex = Regex::new(r"([.!?])\s+([A-Z0-9])").unwrap();
 }
 
 #[derive(Debug)]
@@ -645,6 +652,50 @@ fn normalize_text_whitespace(text: &str) -> String {
         .join("\n\n")
 }
 
+fn apply_smart_markdown_breaks(text: &str) -> String {
+    let lines: Vec<&str> = text.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    if lines.is_empty() {
+        return String::new();
+    }
+
+    let mut out = String::new();
+    let mut i = 0usize;
+    while i < lines.len() {
+        let line = lines[i];
+        if line.starts_with('-') || line.starts_with('•') || line.starts_with('*') {
+            if !out.is_empty() && !out.ends_with("\n\n") {
+                out.push_str("\n\n");
+            }
+            out.push_str(line);
+            out.push('\n');
+            i += 1;
+            continue;
+        }
+
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push(' ');
+        }
+        out.push_str(line);
+
+        let ends_sentence = line.ends_with('.') || line.ends_with('!') || line.ends_with('?') || line.ends_with(':');
+        let next_starts_new_sentence = lines.get(i + 1).and_then(|n| n.chars().next()).is_some_and(|c| c.is_uppercase());
+
+        if ends_sentence && next_starts_new_sentence {
+            out.push_str("\n\n");
+        }
+
+        i += 1;
+    }
+
+    let mut result = out.lines().map(str::trim_end).collect::<Vec<_>>().join("\n");
+
+    // If OCR returned one huge run-on line, inject markdown paragraph breaks
+    // at likely sentence boundaries and before bullet markers.
+    result = SENTENCE_BREAK_RE.replace_all(&result, "$1\n\n$2").into_owned();
+    result = result.replace(" • ", "\n\n• ");
+    result.replace("\n\n\n", "\n\n")
+}
+
 fn clean_duplicate_recognized_text(text: &str) -> String {
     let sections: Vec<String> = text.split("\n\n").map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
 
@@ -723,7 +774,7 @@ fn trim_inline_near_duplicate_passage(text: &str) -> String {
     text.to_string()
 }
 
-fn collect_recognized_text(notebook: &Notebook, normalize_whitespace: bool) -> String {
+fn collect_recognized_text(notebook: &Notebook, normalize_whitespace: bool, smart_markdown_breaks: bool) -> String {
     let mut page_chunks = Vec::new();
     for (index, page) in notebook.pages.iter().enumerate() {
         if let Some(text) = page.recognized_text.as_deref() {
@@ -734,10 +785,15 @@ fn collect_recognized_text(notebook: &Notebook, normalize_whitespace: bool) -> S
                     continue;
                 }
                 let deduped_inline = trim_inline_near_duplicate_passage(&deduped);
-                let final_text = if normalize_whitespace {
+                let normalized = if normalize_whitespace {
                     normalize_text_whitespace(&deduped_inline)
                 } else {
                     deduped_inline
+                };
+                let final_text = if smart_markdown_breaks {
+                    apply_smart_markdown_breaks(&normalized)
+                } else {
+                    normalized
                 };
                 page_chunks.push(format!("### Page {}\n\n{}", index + 1, final_text));
             }
@@ -747,7 +803,7 @@ fn collect_recognized_text(notebook: &Notebook, normalize_whitespace: bool) -> S
 }
 
 fn notebook_to_text(notebook: &Notebook, normalize_whitespace: bool) -> String {
-    let text = collect_recognized_text(notebook, normalize_whitespace);
+    let text = collect_recognized_text(notebook, normalize_whitespace, false);
     if text.trim().is_empty() { String::new() } else { format!("{}\n", text) }
 }
 
@@ -762,7 +818,13 @@ fn filesystem_timestamp_string(input_path: &Path, kind: &str) -> Option<String> 
     Some(dt.to_rfc3339())
 }
 
-fn notebook_to_markdown(input_path: &Path, output_pdf_path: Option<&Path>, notebook: &Notebook, normalize_whitespace: bool) -> String {
+fn notebook_to_markdown(
+    input_path: &Path,
+    output_pdf_path: Option<&Path>,
+    notebook: &Notebook,
+    normalize_whitespace: bool,
+    smart_markdown_breaks: bool,
+) -> String {
     let title = input_path
         .file_stem()
         .or_else(|| input_path.file_name())
@@ -803,7 +865,7 @@ fn notebook_to_markdown(input_path: &Path, output_pdf_path: Option<&Path>, noteb
 
     let pdf_name = output_pdf_path.and_then(|path| path.file_name().map(|s| s.to_string_lossy().into_owned()));
 
-    let recognized_text = collect_recognized_text(notebook, normalize_whitespace);
+    let recognized_text = collect_recognized_text(notebook, normalize_whitespace, smart_markdown_breaks);
     let text_section = if recognized_text.trim().is_empty() {
         "_No recognized text found._".to_string()
     } else {
@@ -842,12 +904,18 @@ fn extract_note_text(input_path: &Path, output_path: &Path, normalize_whitespace
     Ok(())
 }
 
-fn extract_note_markdown(input_path: &Path, output_path: &Path, output_pdf_path: Option<&Path>, normalize_whitespace: bool) -> Result<()> {
+fn extract_note_markdown(
+    input_path: &Path,
+    output_path: &Path,
+    output_pdf_path: Option<&Path>,
+    normalize_whitespace: bool,
+    smart_markdown_breaks: bool,
+) -> Result<()> {
     let notebook = {
         let mut file = File::open(input_path)?;
         parse_notebook(&mut file)?
     };
-    let markdown = notebook_to_markdown(input_path, output_pdf_path, &notebook, normalize_whitespace);
+    let markdown = notebook_to_markdown(input_path, output_pdf_path, &notebook, normalize_whitespace, smart_markdown_breaks);
 
     let out_file = File::create(output_path)?;
     let mut writer = BufWriter::new(out_file);
@@ -1032,6 +1100,7 @@ fn process_single_file(
     pdf_and_markdown: bool,
     markdown_only: bool,
     normalize_text_whitespace: bool,
+    smart_markdown_breaks: bool,
 ) -> Result<()> {
     if input_file.extension().is_none_or(|s| s != "note") {
         bail!("Input file '{}' must have a .note extension.", input_file.display());
@@ -1104,9 +1173,10 @@ fn process_single_file(
                 .expect("markdown output path should be set when --pdf-and-markdown is enabled"),
             Some(output_file),
             normalize_text_whitespace,
+            smart_markdown_breaks,
         )?;
     } else if markdown_only {
-        extract_note_markdown(input_file, output_file, None, normalize_text_whitespace)?;
+        extract_note_markdown(input_file, output_file, None, normalize_text_whitespace, smart_markdown_breaks)?;
     } else {
         convert_note_to_pdf(input_file, output_file)?;
     }
@@ -1148,6 +1218,7 @@ fn process_directory(
     pdf_and_markdown: bool,
     markdown_only: bool,
     normalize_text_whitespace: bool,
+    smart_markdown_breaks: bool,
 ) -> Result<()> {
     if output_dir.is_file() {
         bail!(
@@ -1223,10 +1294,16 @@ fn process_directory(
         } else if pdf_and_markdown {
             convert_note_to_pdf(&input_path, &output_path).and_then(|_| {
                 let markdown_path = markdown_output_for_pdf_path(&output_path);
-                extract_note_markdown(&input_path, &markdown_path, Some(&output_path), normalize_text_whitespace)
+                extract_note_markdown(
+                    &input_path,
+                    &markdown_path,
+                    Some(&output_path),
+                    normalize_text_whitespace,
+                    smart_markdown_breaks,
+                )
             })
         } else if markdown_only {
-            extract_note_markdown(&input_path, &output_path, None, normalize_text_whitespace)
+            extract_note_markdown(&input_path, &output_path, None, normalize_text_whitespace, smart_markdown_breaks)
         } else {
             convert_note_to_pdf(&input_path, &output_path)
         };
@@ -1265,6 +1342,9 @@ fn main() -> Result<()> {
     if cli.normalize_text_whitespace && !(cli.pdf_and_markdown || cli.markdown_only || cli.extract_text) {
         bail!("--normalize-text-whitespace requires --pdf-and-markdown, --markdown-only, or --extract-text");
     }
+    if cli.smart_markdown_breaks && !(cli.pdf_and_markdown || cli.markdown_only) {
+        bail!("--smart-markdown-breaks requires --pdf-and-markdown or --markdown-only");
+    }
 
     if !cli.input.exists() {
         bail!("Input path '{}' does not exist.", cli.input.display());
@@ -1278,6 +1358,7 @@ fn main() -> Result<()> {
             cli.pdf_and_markdown,
             cli.markdown_only,
             cli.normalize_text_whitespace,
+            cli.smart_markdown_breaks,
         )?;
     } else if cli.input.is_file() {
         process_single_file(
@@ -1287,6 +1368,7 @@ fn main() -> Result<()> {
             cli.pdf_and_markdown,
             cli.markdown_only,
             cli.normalize_text_whitespace,
+            cli.smart_markdown_breaks,
         )?;
     } else {
         bail!("Input path '{}' is not a regular file or directory.", cli.input.display());
@@ -1298,8 +1380,8 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Notebook, Page, clean_duplicate_recognized_text, decode_base64, markdown_output_for_pdf_path, normalize_text_whitespace,
-        notebook_to_markdown, parse_recognition_payload,
+        Notebook, Page, apply_smart_markdown_breaks, clean_duplicate_recognized_text, decode_base64, markdown_output_for_pdf_path,
+        normalize_text_whitespace, notebook_to_markdown, parse_recognition_payload,
     };
     use std::collections::HashMap;
     use std::path::Path;
@@ -1369,6 +1451,7 @@ mod tests {
             Some(Path::new("Archive/Meeting Agenda.pdf")),
             &notebook,
             false,
+            false,
         );
         assert!(markdown.contains("# Meeting Agenda"));
         assert!(markdown.contains("## PDF Attachment"));
@@ -1395,7 +1478,7 @@ mod tests {
             metadata: HashMap::new(),
         };
 
-        let markdown = notebook_to_markdown(Path::new("My Notes/Meeting Agenda.note"), None, &notebook, false);
+        let markdown = notebook_to_markdown(Path::new("My Notes/Meeting Agenda.note"), None, &notebook, false, false);
         assert!(!markdown.contains("## PDF Attachment"));
         assert!(!markdown.contains("pdf_attachment:"));
         assert!(markdown.contains("## Text"));
@@ -1406,6 +1489,13 @@ mod tests {
         let input = "Line one\nline two\n\nPara two\nline b";
         let normalized = normalize_text_whitespace(input);
         assert_eq!(normalized, "Line one line two\n\nPara two line b");
+    }
+
+    #[test]
+    fn smart_markdown_breaks_adds_blank_lines_after_sentences() {
+        let input = "This is sentence one. Next starts here. Final line.";
+        let formatted = apply_smart_markdown_breaks(input);
+        assert!(formatted.contains("sentence one.\n\nNext starts here."));
     }
 
     #[test]
