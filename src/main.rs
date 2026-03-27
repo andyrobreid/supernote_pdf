@@ -715,6 +715,69 @@ fn extract_supernote_timestamp(metadata: &HashMap<String, String>, candidates: &
     None
 }
 
+fn normalize_keyword_token(raw: &str) -> Option<String> {
+    let lowered = raw.trim().to_lowercase();
+    if lowered.is_empty() {
+        return None;
+    }
+
+    let mut cleaned = String::with_capacity(lowered.len());
+    let mut prev_sep = false;
+    for ch in lowered.chars() {
+        if ch.is_ascii_alphanumeric() {
+            cleaned.push(ch);
+            prev_sep = false;
+        } else if !prev_sep && !cleaned.is_empty() {
+            cleaned.push(' ');
+            prev_sep = true;
+        }
+    }
+
+    let normalized = cleaned.trim();
+    if normalized.is_empty() {
+        return None;
+    }
+
+    let words: Vec<&str> = normalized.split_whitespace().collect();
+    if words.is_empty() || words.len() > 2 {
+        return None;
+    }
+
+    Some(words.join("-"))
+}
+
+fn normalize_keywords(raw_values: &[String]) -> Vec<String> {
+    let mut unique: HashSet<String> = HashSet::new();
+
+    for raw in raw_values {
+        for token in raw.split(&[',', ';', '\n', '\r', '\t', '|'][..]) {
+            if let Some(keyword) = normalize_keyword_token(token) {
+                unique.insert(keyword);
+            }
+        }
+    }
+
+    let mut keywords: Vec<String> = unique.into_iter().collect();
+    keywords.sort();
+    keywords
+}
+
+fn extract_supernote_keywords(metadata: &HashMap<String, String>) -> Vec<String> {
+    let metadata_upper: HashMap<String, &String> = metadata.iter().map(|(k, v)| (k.to_ascii_uppercase(), v)).collect();
+    let candidate_keys = ["KEYWORD", "KEYWORDS", "FILE_KEYWORD", "FILE_KEYWORDS"];
+
+    let mut raw_values: Vec<String> = Vec::new();
+    for key in candidate_keys {
+        if let Some(value) = metadata_upper.get(key)
+            && !value.trim().is_empty()
+        {
+            raw_values.push((*value).clone());
+        }
+    }
+
+    normalize_keywords(&raw_values)
+}
+
 fn normalize_text_whitespace(text: &str) -> String {
     text.split("\n\n")
         .map(|paragraph| {
@@ -1015,6 +1078,13 @@ fn notebook_to_markdown(
     };
 
     let pdf_frontmatter = pdf_name.as_ref().map(|name| format!("pdf_attachment: {name}\n")).unwrap_or_default();
+    let keywords = extract_supernote_keywords(&notebook.metadata);
+    let keywords_frontmatter = if keywords.is_empty() {
+        String::new()
+    } else {
+        let items = keywords.iter().map(|kw| format!("  - {kw}")).collect::<Vec<_>>().join("\n");
+        format!("keywords:\n{items}\n")
+    };
 
     let pdf_section = pdf_name
         .as_ref()
@@ -1022,7 +1092,7 @@ fn notebook_to_markdown(
         .unwrap_or_default();
 
     format!(
-        "---\nname: {title}\nsupernote_id: {supernote_id}\nsource: {source_path}\nsupernote_created: {supernote_created}\nsupernote_modified: {supernote_modified}\nfile_created: {file_created}\nfile_modified: {file_modified}\nsize: {file_size}\n{pdf_frontmatter}tags:\n  - supernote\n---\n\n# {title}\n\n## Note Information\n\n| Property | Value |\n|----------|-------|\n| **Source** | `{source_path}` |\n| **Supernote Created** | {supernote_created} |\n| **Supernote Modified** | {supernote_modified} |\n| **File Created** | {file_created} |\n| **File Modified** | {file_modified} |\n| **Size** | {file_size} |\n{pdf_section}\n## Text\n\n{text_section}\n"
+        "---\nname: {title}\nsupernote_id: {supernote_id}\nsource: {source_path}\nsupernote_created: {supernote_created}\nsupernote_modified: {supernote_modified}\nfile_created: {file_created}\nfile_modified: {file_modified}\nsize: {file_size}\n{pdf_frontmatter}{keywords_frontmatter}tags:\n  - supernote\n---\n\n# {title}\n\n## Note Information\n\n| Property | Value |\n|----------|-------|\n| **Source** | `{source_path}` |\n| **Supernote Created** | {supernote_created} |\n| **Supernote Modified** | {supernote_modified} |\n| **File Created** | {file_created} |\n| **File Modified** | {file_modified} |\n| **Size** | {file_size} |\n{pdf_section}\n## Text\n\n{text_section}\n"
     )
 }
 
@@ -1585,7 +1655,7 @@ fn main() -> Result<()> {
 mod tests {
     use super::{
         Notebook, Page, apply_smart_markdown_breaks, clean_duplicate_recognized_text, decode_base64, format_timestamp_value,
-        markdown_output_for_pdf_path, normalize_text_whitespace, notebook_to_markdown, parse_recognition_payload,
+        markdown_output_for_pdf_path, normalize_keywords, normalize_text_whitespace, notebook_to_markdown, parse_recognition_payload,
     };
     use std::collections::HashMap;
     use std::path::Path;
@@ -1768,5 +1838,50 @@ mod tests {
 
         assert!(markdown.contains("supernote_created: 2025-05-07T17:52:27+00:00"));
         assert!(markdown.contains("supernote_modified: 2025-05-07T17:52:27+00:00"));
+    }
+
+    #[test]
+    fn normalize_keywords_dedupes_sorts_and_limits_to_two_words() {
+        let input = vec![
+            " Project  Alpha ".to_string(),
+            "project alpha".to_string(),
+            "alpha".to_string(),
+            "three word phrase".to_string(),
+            "Brainstorm!".to_string(),
+            "foo/bar".to_string(),
+        ];
+
+        let out = normalize_keywords(&input);
+        assert_eq!(out, vec!["alpha", "brainstorm", "foo-bar", "project-alpha"]);
+    }
+
+    #[test]
+    fn notebook_to_markdown_writes_keywords_frontmatter_when_present() {
+        let mut metadata = HashMap::new();
+        metadata.insert("KEYWORDS".to_string(), " Project Alpha, brainstorming ; three word phrase ".to_string());
+
+        let notebook = Notebook {
+            signature: "SN_FILE_VER_20230015".to_string(),
+            pages: vec![Page {
+                addr: 1,
+                layers: vec![],
+                recognized_text: Some("Line one".to_string()),
+            }],
+            width: 1404,
+            height: 1872,
+            metadata,
+        };
+
+        let markdown = notebook_to_markdown(Path::new("My Notes/Meeting Agenda.note"), None, &notebook, false, false);
+        assert!(markdown.contains(
+            "keywords:
+  - brainstorming
+  - project-alpha
+"
+        ));
+        assert!(markdown.contains(
+            "tags:
+  - supernote"
+        ));
     }
 }
