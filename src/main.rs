@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, bail};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDateTime, Utc};
 use clap::Parser;
 use flate2::Compression;
 use flate2::write::ZlibEncoder;
@@ -9,7 +9,7 @@ use itertools::Itertools;
 use lazy_static::lazy_static;
 use rayon::prelude::*;
 use regex::Regex;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::{self, File};
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
@@ -158,6 +158,71 @@ fn parse_metadata_block(file: &mut File, address: u64) -> Result<HashMap<String,
         .collect();
 
     Ok(map)
+}
+
+fn key_is_plausible_metadata_key(key: &str) -> bool {
+    !key.is_empty() && key.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+}
+
+fn metadata_map_looks_valid(map: &HashMap<String, String>) -> bool {
+    if map.is_empty() {
+        return false;
+    }
+
+    let plausible = map.keys().filter(|k| key_is_plausible_metadata_key(k)).count();
+    plausible > 0 && plausible * 2 >= map.len()
+}
+
+fn merge_metadata(target: &mut HashMap<String, String>, source: HashMap<String, String>) {
+    for (key, value) in source {
+        if value.trim().is_empty() {
+            continue;
+        }
+        target.entry(key).or_insert(value);
+    }
+}
+
+fn collect_nested_metadata(file: &mut File, footer_map: &HashMap<String, String>) -> HashMap<String, String> {
+    const MAX_DEPTH: usize = 4;
+    const MAX_BLOCKS: usize = 1024;
+
+    let mut merged = footer_map.clone();
+    let mut queue: Vec<(u64, usize)> = footer_map
+        .values()
+        .filter_map(|v| v.parse::<u64>().ok())
+        .filter(|addr| *addr > 0)
+        .map(|addr| (addr, 1usize))
+        .collect();
+    let mut visited: HashSet<u64> = HashSet::new();
+
+    while let Some((addr, depth)) = queue.pop() {
+        if depth > MAX_DEPTH || visited.contains(&addr) || visited.len() >= MAX_BLOCKS {
+            continue;
+        }
+        visited.insert(addr);
+
+        let Ok(map) = parse_metadata_block(file, addr) else {
+            continue;
+        };
+
+        if !metadata_map_looks_valid(&map) {
+            continue;
+        }
+
+        let next_addrs: Vec<u64> = map
+            .values()
+            .filter_map(|v| v.parse::<u64>().ok())
+            .filter(|next_addr| *next_addr > 0)
+            .collect();
+
+        merge_metadata(&mut merged, map);
+
+        if depth < MAX_DEPTH {
+            queue.extend(next_addrs.into_iter().map(|next_addr| (next_addr, depth + 1)));
+        }
+    }
+
+    merged
 }
 
 fn decode_base64(input: &str) -> Result<Vec<u8>> {
@@ -477,12 +542,14 @@ fn parse_notebook(file: &mut File) -> Result<Notebook> {
         });
     }
 
+    let metadata = collect_nested_metadata(file, &footer_map);
+
     Ok(Notebook {
         signature: file_signature,
         pages,
         width,
         height,
-        metadata: footer_map,
+        metadata,
     })
 }
 
@@ -618,6 +685,12 @@ fn format_file_size(bytes: u64) -> String {
 fn format_timestamp_value(raw: &str) -> String {
     let trimmed = raw.trim();
     if trimmed.chars().all(|c| c.is_ascii_digit()) {
+        if (trimmed.len() == 14 || trimmed.len() == 17 || trimmed.len() == 20)
+            && let Ok(dt) = NaiveDateTime::parse_from_str(&trimmed[..14], "%Y%m%d%H%M%S")
+        {
+            return dt.and_utc().to_rfc3339();
+        }
+
         if let Ok(ms) = trimmed.parse::<i64>() {
             let seconds = if trimmed.len() >= 13 { ms / 1000 } else { ms };
             if let Some(dt) = DateTime::<Utc>::from_timestamp(seconds, 0) {
@@ -838,6 +911,27 @@ fn filesystem_timestamp_string(input_path: &Path, kind: &str) -> Option<String> 
     Some(dt.to_rfc3339())
 }
 
+fn infer_timestamp_from_filename(input_path: &Path) -> Option<String> {
+    let stem = input_path.file_stem()?.to_string_lossy();
+    let digits: String = stem.chars().filter(|c| c.is_ascii_digit()).collect();
+
+    if digits.len() < 14 {
+        return None;
+    }
+
+    for idx in 0..=digits.len() - 14 {
+        let candidate = &digits[idx..idx + 14];
+        if !candidate.starts_with("20") {
+            continue;
+        }
+        if let Ok(dt) = NaiveDateTime::parse_from_str(candidate, "%Y%m%d%H%M%S") {
+            return Some(dt.and_utc().to_rfc3339());
+        }
+    }
+
+    None
+}
+
 fn notebook_to_markdown(
     input_path: &Path,
     output_pdf_path: Option<&Path>,
@@ -853,29 +947,57 @@ fn notebook_to_markdown(
 
     let source_path = format!("/Note/{}.note", title);
     let supernote_id = stable_supernote_id(&source_path);
+    let inferred_filename_timestamp = infer_timestamp_from_filename(input_path);
+
     let supernote_created = extract_supernote_timestamp(
         &notebook.metadata,
         &[
             "CREATE_TIME",
+            "CREATE_DATE",
             "CREATEDATE",
             "CREATETIME",
+            "CREATED_TIME",
+            "CREATED_AT",
+            "CREATE_TIMESTAMP",
+            "CREATETIMESTAMP",
             "FILE_CREATE_TIME",
+            "FILE_CREATE_DATE",
             "FILE_CREATEDATE",
             "FILE_CREATETIME",
+            "FILE_CREATED_TIME",
+            "FILE_CREATE_TIMESTAMP",
         ],
     )
+    .or_else(|| inferred_filename_timestamp.clone())
     .unwrap_or_else(|| "unknown".to_string());
     let supernote_modified = extract_supernote_timestamp(
         &notebook.metadata,
         &[
             "LASTMODIFYDATE",
+            "LAST_MODIFY_DATE",
+            "LASTMODIFYTIME",
+            "LAST_MODIFY_TIME",
+            "MODIFY_DATE",
+            "MODIFYDATE",
             "MODIFY_TIME",
+            "MODIFYTIME",
+            "MODIFIED_AT",
+            "UPDATE_TIME",
             "UPDATETIME",
+            "UPDATE_TIMESTAMP",
+            "UPDATETIMESTAMP",
             "FILE_LASTMODIFYDATE",
+            "FILE_LAST_MODIFY_DATE",
+            "FILE_LASTMODIFYTIME",
+            "FILE_LAST_MODIFY_TIME",
+            "FILE_MODIFY_DATE",
             "FILE_MODIFY_TIME",
             "FILE_UPDATETIME",
+            "FILE_UPDATE_TIME",
+            "FILE_UPDATE_TIMESTAMP",
         ],
     )
+    .or(inferred_filename_timestamp)
     .unwrap_or_else(|| "unknown".to_string());
     let file_created = filesystem_timestamp_string(input_path, "created").unwrap_or_else(|| "unknown".to_string());
     let file_modified = filesystem_timestamp_string(input_path, "modified").unwrap_or_else(|| "unknown".to_string());
@@ -1462,8 +1584,8 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Notebook, Page, apply_smart_markdown_breaks, clean_duplicate_recognized_text, decode_base64, markdown_output_for_pdf_path,
-        normalize_text_whitespace, notebook_to_markdown, parse_recognition_payload,
+        Notebook, Page, apply_smart_markdown_breaks, clean_duplicate_recognized_text, decode_base64, format_timestamp_value,
+        markdown_output_for_pdf_path, normalize_text_whitespace, notebook_to_markdown, parse_recognition_payload,
     };
     use std::collections::HashMap;
     use std::path::Path;
@@ -1595,5 +1717,56 @@ mod tests {
         let input = format!("{} {}", base, duplicate);
         let trimmed = super::trim_inline_near_duplicate_passage(&input);
         assert_eq!(trimmed, base);
+    }
+
+    #[test]
+    fn format_timestamp_value_parses_compact_supernote_timestamp() {
+        assert_eq!(format_timestamp_value("20251208073942"), "2025-12-08T07:39:42+00:00");
+        assert_eq!(format_timestamp_value("20251208073942651"), "2025-12-08T07:39:42+00:00");
+    }
+
+    #[test]
+    fn notebook_to_markdown_reads_common_created_modified_variants() {
+        let mut metadata = HashMap::new();
+        metadata.insert("CREATE_TIMESTAMP".to_string(), "1734289404000".to_string());
+        metadata.insert("LASTMODIFYTIME".to_string(), "20251208073942651008".to_string());
+
+        let notebook = Notebook {
+            signature: "SN_FILE_VER_20230015".to_string(),
+            pages: vec![Page {
+                addr: 1,
+                layers: vec![],
+                recognized_text: Some("Line one".to_string()),
+            }],
+            width: 1404,
+            height: 1872,
+            metadata,
+        };
+
+        let markdown = notebook_to_markdown(Path::new("My Notes/Meeting Agenda.note"), None, &notebook, false, false);
+
+        assert!(markdown.contains("supernote_created: 2024-12-15T19:03:24+00:00"));
+        assert!(markdown.contains("supernote_modified: 2025-12-08T07:39:42+00:00"));
+        assert!(markdown.contains("| **Supernote Modified** | 2025-12-08T07:39:42+00:00 |"));
+    }
+
+    #[test]
+    fn notebook_to_markdown_falls_back_to_filename_timestamp() {
+        let notebook = Notebook {
+            signature: "SN_FILE_VER_20230015".to_string(),
+            pages: vec![Page {
+                addr: 1,
+                layers: vec![],
+                recognized_text: Some("Line one".to_string()),
+            }],
+            width: 1404,
+            height: 1872,
+            metadata: HashMap::new(),
+        };
+
+        let markdown = notebook_to_markdown(Path::new("20250507_175227.note"), None, &notebook, false, false);
+
+        assert!(markdown.contains("supernote_created: 2025-05-07T17:52:27+00:00"));
+        assert!(markdown.contains("supernote_modified: 2025-05-07T17:52:27+00:00"));
     }
 }
