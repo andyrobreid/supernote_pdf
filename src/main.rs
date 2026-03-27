@@ -10,6 +10,7 @@ use lazy_static::lazy_static;
 use rayon::prelude::*;
 use regex::Regex;
 use std::collections::HashMap;
+use std::env;
 use std::fs::{self, File};
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -36,8 +37,12 @@ struct Cli {
     pdf_and_markdown: bool,
 
     /// Generate markdown-only output (.md) from recognized text without generating PDFs
-    #[arg(long, default_value_t = false, conflicts_with_all = ["extract_text", "pdf_and_markdown"])]
+    #[arg(long, default_value_t = false, conflicts_with_all = ["extract_text", "pdf_and_markdown", "auto_output"])]
     markdown_only: bool,
+
+    /// Smart mode: always generate PDF, and generate markdown only when recognized text exists
+    #[arg(long, default_value_t = false, conflicts_with_all = ["extract_text", "pdf_and_markdown", "markdown_only"])]
+    auto_output: bool,
 
     /// Normalize recognized text whitespace in markdown/text output: single newlines become spaces,
     /// paragraph breaks (double newlines) are preserved
@@ -807,6 +812,21 @@ fn notebook_to_text(notebook: &Notebook, normalize_whitespace: bool) -> String {
     if text.trim().is_empty() { String::new() } else { format!("{}\n", text) }
 }
 
+fn notebook_has_recognized_text(notebook: &Notebook) -> bool {
+    notebook
+        .pages
+        .iter()
+        .any(|page| page.recognized_text.as_deref().is_some_and(|t| !t.trim().is_empty()))
+}
+
+fn note_has_recognized_text(input_path: &Path) -> Result<bool> {
+    let notebook = {
+        let mut file = File::open(input_path)?;
+        parse_notebook(&mut file)?
+    };
+    Ok(notebook_has_recognized_text(&notebook))
+}
+
 fn filesystem_timestamp_string(input_path: &Path, kind: &str) -> Option<String> {
     let metadata = std::fs::metadata(input_path).ok()?;
     let ts = match kind {
@@ -1099,6 +1119,7 @@ fn process_single_file(
     extract_text: bool,
     pdf_and_markdown: bool,
     markdown_only: bool,
+    auto_output: bool,
     normalize_text_whitespace: bool,
     smart_markdown_breaks: bool,
 ) -> Result<()> {
@@ -1127,7 +1148,7 @@ fn process_single_file(
             output_file.display()
         );
     }
-    let markdown_file = if pdf_and_markdown {
+    let markdown_file = if pdf_and_markdown || auto_output {
         let markdown_file = markdown_output_for_pdf_path(output_file);
         if markdown_file.exists() {
             bail!(
@@ -1146,6 +1167,8 @@ fn process_single_file(
         println!("Converting single file and generating markdown...");
     } else if markdown_only {
         println!("Generating markdown from single file...");
+    } else if auto_output {
+        println!("Converting single file with smart auto output (PDF + optional markdown)...");
     } else {
         println!("Converting single file...");
     }
@@ -1157,6 +1180,8 @@ fn process_single_file(
         "Converting and extracting text from"
     } else if markdown_only {
         "Extracting markdown from"
+    } else if auto_output {
+        "Smart converting"
     } else {
         "Converting"
     };
@@ -1177,6 +1202,19 @@ fn process_single_file(
         )?;
     } else if markdown_only {
         extract_note_markdown(input_file, output_file, None, normalize_text_whitespace, smart_markdown_breaks)?;
+    } else if auto_output {
+        convert_note_to_pdf(input_file, output_file)?;
+        if note_has_recognized_text(input_file)? {
+            extract_note_markdown(
+                input_file,
+                markdown_file
+                    .as_deref()
+                    .expect("markdown output path should be set when --auto-output is enabled"),
+                Some(output_file),
+                normalize_text_whitespace,
+                smart_markdown_breaks,
+            )?;
+        }
     } else {
         convert_note_to_pdf(input_file, output_file)?;
     }
@@ -1187,11 +1225,15 @@ fn process_single_file(
         "PDF and markdown generation complete!"
     } else if markdown_only {
         "Markdown generation complete!"
+    } else if auto_output {
+        "Smart conversion complete!"
     } else {
         "Conversion complete!"
     };
     pb.finish_with_message(done_message);
-    if let Some(markdown_file) = markdown_file {
+    if let Some(markdown_file) = markdown_file
+        && markdown_file.exists()
+    {
         println!(
             "Successfully processed '{}' to '{}' and '{}' in {:?}",
             input_file.display(),
@@ -1217,6 +1259,7 @@ fn process_directory(
     extract_text: bool,
     pdf_and_markdown: bool,
     markdown_only: bool,
+    auto_output: bool,
     normalize_text_whitespace: bool,
     smart_markdown_breaks: bool,
 ) -> Result<()> {
@@ -1267,6 +1310,11 @@ fn process_directory(
         println!("Found {} files to convert and generate markdown for. Starting processing...", num_jobs);
     } else if markdown_only {
         println!("Found {} files to generate markdown for. Starting processing...", num_jobs);
+    } else if auto_output {
+        println!(
+            "Found {} files to smart-convert (PDF + optional markdown). Starting processing...",
+            num_jobs
+        );
     } else {
         println!("Found {} files to convert. Starting conversion...", num_jobs);
     }
@@ -1281,6 +1329,8 @@ fn process_directory(
             "Converting and extracting text from"
         } else if markdown_only {
             "Extracting markdown from"
+        } else if auto_output {
+            "Smart converting"
         } else {
             "Converting"
         };
@@ -1304,6 +1354,21 @@ fn process_directory(
             })
         } else if markdown_only {
             extract_note_markdown(&input_path, &output_path, None, normalize_text_whitespace, smart_markdown_breaks)
+        } else if auto_output {
+            convert_note_to_pdf(&input_path, &output_path).and_then(|_| {
+                if note_has_recognized_text(&input_path)? {
+                    let markdown_path = markdown_output_for_pdf_path(&output_path);
+                    extract_note_markdown(
+                        &input_path,
+                        &markdown_path,
+                        Some(&output_path),
+                        normalize_text_whitespace,
+                        smart_markdown_breaks,
+                    )
+                } else {
+                    Ok(())
+                }
+            })
         } else {
             convert_note_to_pdf(&input_path, &output_path)
         };
@@ -1319,6 +1384,8 @@ fn process_directory(
         "All PDF and markdown files generated!"
     } else if markdown_only {
         "All markdown files generated!"
+    } else if auto_output {
+        "All files smart-converted!"
     } else {
         "All files converted!"
     };
@@ -1329,6 +1396,8 @@ fn process_directory(
         println!("Converted and generated markdown for {} files in {:?}", num_jobs, start.elapsed());
     } else if markdown_only {
         println!("Generated markdown for {} files in {:?}", num_jobs, start.elapsed());
+    } else if auto_output {
+        println!("Smart-converted {} files in {:?}", num_jobs, start.elapsed());
     } else {
         println!("Converted {} files in {:?}", num_jobs, start.elapsed());
     }
@@ -1336,17 +1405,26 @@ fn process_directory(
     Ok(())
 }
 
+fn maybe_print_bin_migration_notice() {
+    if let Some(argv0) = env::args().next()
+        && argv0.ends_with("supernote_pdf")
+    {
+        eprintln!("[deprecation] 'supernote_pdf' is kept for compatibility; prefer 'supernote_sync' for new scripts.");
+    }
+}
+
 fn main() -> Result<()> {
+    maybe_print_bin_migration_notice();
     let cli = Cli::parse();
 
-    if cli.normalize_text_whitespace && !(cli.pdf_and_markdown || cli.markdown_only || cli.extract_text) {
-        bail!("--normalize-text-whitespace requires --pdf-and-markdown, --markdown-only, or --extract-text");
+    if cli.normalize_text_whitespace && !(cli.pdf_and_markdown || cli.markdown_only || cli.auto_output || cli.extract_text) {
+        bail!("--normalize-text-whitespace requires --pdf-and-markdown, --markdown-only, --auto-output, or --extract-text");
     }
     if !cli.input.exists() {
         bail!("Input path '{}' does not exist.", cli.input.display());
     }
 
-    let effective_smart_markdown_breaks = if cli.pdf_and_markdown || cli.markdown_only {
+    let effective_smart_markdown_breaks = if cli.pdf_and_markdown || cli.markdown_only || cli.auto_output {
         true
     } else {
         cli.smart_markdown_breaks
@@ -1359,6 +1437,7 @@ fn main() -> Result<()> {
             cli.extract_text,
             cli.pdf_and_markdown,
             cli.markdown_only,
+            cli.auto_output,
             cli.normalize_text_whitespace,
             effective_smart_markdown_breaks,
         )?;
@@ -1369,6 +1448,7 @@ fn main() -> Result<()> {
             cli.extract_text,
             cli.pdf_and_markdown,
             cli.markdown_only,
+            cli.auto_output,
             cli.normalize_text_whitespace,
             effective_smart_markdown_breaks,
         )?;

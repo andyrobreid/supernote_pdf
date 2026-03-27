@@ -52,13 +52,15 @@ Several key design decisions were made to optimize for the primary goal of fast,
 
 ### From Crates.io (Recommended)
 
-Ensure you have the [Rust toolchain installed](https://www.rust-lang.org/tools/install). Then, you can install `supernote_pdf` CLI directly from Crates.io using `cargo`:
+Ensure you have the [Rust toolchain installed](https://www.rust-lang.org/tools/install). Then install from Crates.io:
 
 ```bash
 cargo install supernote_pdf
 ```
 
-and `supernote_pdf` will be available as a tool in your shell.
+This now installs **two compatible binary names**:
+- `supernote_sync` (new preferred name)
+- `supernote_pdf` (legacy name, still supported)
 
 ### From Source
 
@@ -86,7 +88,9 @@ To generate both a PDF and a Markdown file per note, add `--pdf-and-markdown`. T
 
 To generate Markdown only (no PDF), add `--markdown-only` and set the output extension to `.md` (or an output directory for batch mode).
 
-If you want cleaner paragraph text in markdown, add `--normalize-text-whitespace` (requires `--pdf-and-markdown` or `--markdown-only`). This converts single newlines to spaces while preserving paragraph breaks (double newlines).
+For **smart default sync behavior**, use `--auto-output`: it always writes PDF, and writes Markdown only when recognized text exists in the `.note` content.
+
+If you want cleaner paragraph text in markdown, add `--normalize-text-whitespace` (requires `--pdf-and-markdown`, `--markdown-only`, or `--auto-output`). This converts single newlines to spaces while preserving paragraph breaks (double newlines).
 
 Smart markdown breaks are now enabled by default in markdown modes (`--pdf-and-markdown` and `--markdown-only`) for better readability in Obsidian. The `--smart-markdown-breaks` flag is kept for compatibility.
 
